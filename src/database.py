@@ -2,12 +2,9 @@ import io
 import logging
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 import requests
 from PIL import Image
-from scipy import ndimage
-from scipy.spatial import cKDTree
 
 from src.config import ConfigManager
 
@@ -15,63 +12,204 @@ logger = logging.getLogger(__name__)
 
 config = ConfigManager()
 
+APP_HOST = config.get("api.host")
+APP_PORT = config.get("api.port")
+GET_IMAGE_VIEW = config.get("api.image_view")
+
 
 def get_dic_analysis_ids(
     db_engine,
     *,
     reference_date: str | datetime | None = None,
+    reference_date_start: str | datetime | None = None,
+    reference_date_end: str | datetime | None = None,
     master_timestamp: str | datetime | None = None,
+    master_timestamp_start: str | datetime | None = None,
+    master_timestamp_end: str | datetime | None = None,
+    slave_timestamp: str | datetime | None = None,
+    slave_timestamp_start: str | datetime | None = None,
+    slave_timestamp_end: str | datetime | None = None,
     camera_id: int | None = None,
     camera_name: str | None = None,
-) -> pd.DataFrame:
+    time_difference_hours: int | None = None,
+    time_difference_min: int | None = None,
+    time_difference_max: int | None = None,
+    month: int | None = None,
+) -> list[int]:
     """
-    Get DIC analysis metadata (including IDs) for a specific date/timestamp and optional camera filter.
+    Search for DIC analysis IDs in the database with flexible filtering options.
+
+    This function allows you to retrieve DIC analysis IDs using a wide range of filters:
+    - By exact reference date, or within a date interval
+    - By master/slave image timestamps (exact or interval)
+    - By camera (ID or name)
+    - By time difference between images (exact, min, max)
+    - By month (on reference_date)
+
+    Parameters:
+        db_engine: SQLAlchemy database engine
+        reference_date: Exact reference date (YYYY-MM-DD or datetime)
+        reference_date_start: Start of reference date interval
+        reference_date_end: End of reference date interval
+        master_timestamp: Exact master image timestamp
+        master_timestamp_start: Start of master timestamp interval
+        master_timestamp_end: End of master timestamp interval
+        slave_timestamp: Exact slave image timestamp
+        slave_timestamp_start: Start of slave timestamp interval
+        slave_timestamp_end: End of slave timestamp interval
+        camera_id: Camera ID
+        camera_name: Camera name
+        time_difference_hours: Exact time difference between images (hours)
+        time_difference_min: Minimum time difference (hours)
+        time_difference_max: Maximum time difference (hours)
+        month: Month (integer, 1-12) for reference_date
+
+    Returns:
+        List of DIC analysis IDs matching the specified filters.
+
+    Example usage:
+        get_dic_analysis_ids(db_engine, reference_date="2024-08-23", camera_name="PPCX_Tele")
+        get_dic_analysis_ids(db_engine, master_timestamp_start="2024-08-01", master_timestamp_end="2024-08-31")
+        get_dic_analysis_ids(db_engine, time_difference_min=1, time_difference_max=24)
+        get_dic_analysis_ids(db_engine, month=8)
     """
     query = """
     SELECT 
-        DIC.id as dic_id,
-        CAM.camera_name,
-        DIC.master_timestamp,
-        DIC.slave_timestamp,
-        DIC.master_image_id,
-        DIC.slave_image_id,
-        DIC.time_difference_hours
+        DIC.id as dic_id
     FROM ppcx_app_dic DIC
     JOIN ppcx_app_image IMG ON DIC.master_image_id = IMG.id
     JOIN ppcx_app_camera CAM ON IMG.camera_id = CAM.id
     WHERE 1=1
     """
     params = []
+
+    # Exact date
     if reference_date is not None:
         query += " AND DATE(DIC.reference_date) = %s"
         params.append(str(reference_date))
+    # Date interval
+    if reference_date_start is not None:
+        query += " AND DATE(DIC.reference_date) >= %s"
+        params.append(str(reference_date_start))
+    if reference_date_end is not None:
+        query += " AND DATE(DIC.reference_date) <= %s"
+        params.append(str(reference_date_end))
+
+    # Exact master timestamp
     if master_timestamp is not None:
-        query += " AND DATE(DIC.master_timestamp) = %s"
+        query += " AND DIC.master_timestamp = %s"
         params.append(str(master_timestamp))
+    # Master timestamp interval
+    if master_timestamp_start is not None:
+        query += " AND DIC.master_timestamp >= %s"
+        params.append(str(master_timestamp_start))
+    if master_timestamp_end is not None:
+        query += " AND DIC.master_timestamp <= %s"
+        params.append(str(master_timestamp_end))
+
+    # Slave timestamp
+    if slave_timestamp is not None:
+        query += " AND DIC.slave_timestamp = %s"
+        params.append(str(slave_timestamp))
+    if slave_timestamp_start is not None:
+        query += " AND DIC.slave_timestamp >= %s"
+        params.append(str(slave_timestamp_start))
+    if slave_timestamp_end is not None:
+        query += " AND DIC.slave_timestamp <= %s"
+        params.append(str(slave_timestamp_end))
+
+    # Camera filters
     if camera_id is not None:
         query += " AND CAM.id = %s"
         params.append(camera_id)
     if camera_name is not None:
         query += " AND CAM.camera_name = %s"
         params.append(camera_name)
+
+    # Time difference (dt) filters
+    if time_difference_hours is not None:
+        query += " AND DIC.time_difference_hours = %s"
+        params.append(time_difference_hours)
+    if time_difference_min is not None:
+        query += " AND DIC.time_difference_hours >= %s"
+        params.append(time_difference_min)
+    if time_difference_max is not None:
+        query += " AND DIC.time_difference_hours <= %s"
+        params.append(time_difference_max)
+
+    # Month filter (on reference_date)
+    if month is not None:
+        query += " AND EXTRACT(MONTH FROM DIC.reference_date) = %s"
+        params.append(month)
+
     query += " ORDER BY DIC.master_timestamp"
+
+    df = pd.read_sql(query, db_engine, params=tuple(params))
+    if df.empty:
+        logger.warning("No DIC analyses found for the given criteria")
+        return []
+    logger.debug(f"Found {len(df)} DIC analyses matching criteria")
+    return df["dic_id"].tolist()
+
+
+def get_dic_analysis_by_ids(
+    db_engine,
+    dic_ids: list[int] | int,
+    query: str | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch DIC analysis metadata by a list of DIC IDs.
+
+    Allows the user to provide a custom SQL SELECT query to retrieve additional or different fields.
+    The query must contain a WHERE DIC.id IN %s clause for filtering.
+
+    Args:
+        db_engine: SQLAlchemy database engine
+        dic_ids: List of DIC analysis IDs or a single ID
+        query: Optional custom SQL SELECT query. If None, uses the default query.
+
+    Returns:
+        DataFrame with the requested fields.
+
+    Example:
+        custom_query = '''
+            SELECT DIC.id as dic_id, DIC.reference_date, DIC.software_used, CAM.camera_name
+            FROM ppcx_app_dic DIC
+            JOIN ppcx_app_image IMG ON DIC.master_image_id = IMG.id
+            JOIN ppcx_app_camera CAM ON IMG.camera_id = CAM.id
+            WHERE DIC.id IN %s
+        '''
+        get_dic_analysis_by_ids(db_engine, dic_ids, query=custom_query)
+    """
+    if isinstance(dic_ids, int):
+        dic_ids = [dic_ids]
+    params = [tuple(dic_ids)]
+    if query is None:
+        query = """
+        SELECT 
+            DIC.id as dic_id,
+            CAM.camera_name,
+            DIC.master_timestamp,
+            DIC.slave_timestamp,
+            DIC.master_image_id,
+            DIC.slave_image_id,
+            DIC.time_difference_hours
+        FROM ppcx_app_dic DIC
+        JOIN ppcx_app_image IMG ON DIC.master_image_id = IMG.id
+        JOIN ppcx_app_camera CAM ON IMG.camera_id = CAM.id
+        WHERE DIC.id IN %s
+        """
     return pd.read_sql(query, db_engine, params=tuple(params))
 
 
 def get_dic_data(
     dic_id: int,
-    app_host: str = None,
-    app_port: str = None,
+    app_host: str = APP_HOST,
+    app_port: str = APP_PORT,
 ) -> pd.DataFrame:
     """
     Fetch DIC displacement data from the Django API endpoint as a DataFrame.
     """
-    # Use config defaults if not provided
-    if app_host is None:
-        app_host = config.get("api.host")
-    if app_port is None:
-        app_port = config.get("api.port")
-
     url = f"http://{app_host}:{app_port}/API/dic/{dic_id}/"
     response = requests.get(url)
     if response.status_code != 200:
@@ -95,258 +233,37 @@ def get_dic_data(
     return df
 
 
-def filter_outliers_by_percentile(
-    df: pd.DataFrame, tails_percentile: float = 0.01, velocity_column: str = "V"
+def get_multi_dic_data(
+    dic_ids: list[int],
+    app_host: str = APP_HOST,
+    app_port: str = APP_PORT,
 ) -> pd.DataFrame:
     """
-    Filter out extreme tails based on the specified percentile.
+    Fetch and concatenate DIC displacement data for multiple DIC IDs.
 
     Args:
-        df: DataFrame with DIC data
-        tails_percentile: Percentile for tail filtering (e.g., 0.01 removes bottom 1% and top 1%)
-        velocity_column: Column name for velocity magnitude
+        dic_ids: List of DIC analysis IDs
+        app_host: API host (optional, defaults to config)
+        app_port: API port (optional, defaults to config)
 
     Returns:
-        Filtered DataFrame
+        Concatenated DataFrame with all DIC data
     """
-    prob_threshold = (tails_percentile, 1 - tails_percentile)
-    velocity_percentiles = df[velocity_column].quantile(prob_threshold).values
+    df_list = []
+    for dic_id in dic_ids:
+        try:
+            df = get_dic_data(dic_id, app_host=app_host, app_port=app_port)
+            df_list.append(df)
+            logger.info(f"Fetched DIC data for id {dic_id} with {len(df)} points")
+        except ValueError as e:
+            logger.warning(f"Skipping DIC id {dic_id}: {e}")
 
-    df_filtered = df[
-        (df[velocity_column] >= velocity_percentiles[0])
-        & (df[velocity_column] <= velocity_percentiles[1])
-    ].reset_index(drop=True)
+    if not df_list:
+        raise ValueError("No valid DIC data found for the provided IDs")
 
-    logger.info(
-        f"Percentile filtering: {len(df)} -> {len(df_filtered)} points "
-        f"(removed {len(df) - len(df_filtered)} outliers)"
-    )
-
-    return df_filtered
-
-
-def filter_by_min_velocity(
-    df: pd.DataFrame, min_velocity: float, velocity_column: str = "V"
-) -> pd.DataFrame:
-    """
-    Filter out low velocity vectors if specified.
-
-    Args:
-        df: DataFrame with DIC data
-        min_velocity: Minimum velocity threshold
-        velocity_column: Column name for velocity magnitude
-
-    Returns:
-        Filtered DataFrame
-    """
-    if min_velocity < 0:
-        logger.info("Minimum velocity filtering disabled")
-        return df
-
-    df_filtered = df[df[velocity_column] >= min_velocity].reset_index(drop=True)
-
-    logger.info(
-        f"Min velocity filtering: {len(df)} -> {len(df_filtered)} points "
-        f"(removed {len(df) - len(df_filtered)} points below {min_velocity})"
-    )
-
-    return df_filtered
-
-
-def create_2d_grid(df: pd.DataFrame, grid_spacing: float = None) -> tuple:
-    """
-    Create a 2D grid from scattered DIC points.
-
-    Args:
-        df: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
-        grid_spacing: Spacing between grid points. If None, estimated from data
-
-    Returns:
-        tuple: (x_grid, y_grid, u_grid, v_grid, v_mag_grid, valid_mask)
-    """
-    if grid_spacing is None:
-        # Estimate grid spacing from minimum distances
-        points = df[["x", "y"]].values
-        tree = cKDTree(points)
-        distances, _ = tree.query(
-            points, k=2
-        )  # k=2 to get distance to nearest neighbor
-        grid_spacing = np.median(
-            distances[:, 1]
-        )  # distances[:, 1] is distance to nearest neighbor
-        logger.info(f"Estimated grid spacing: {grid_spacing:.2f}")
-
-    # Create regular grid
-    x_min, x_max = df["x"].min(), df["x"].max()
-    y_min, y_max = df["y"].min(), df["y"].max()
-
-    x_grid = np.arange(x_min, x_max + grid_spacing, grid_spacing)
-    y_grid = np.arange(y_min, y_max + grid_spacing, grid_spacing)
-
-    # Create meshgrid
-    X, Y = np.meshgrid(x_grid, y_grid)
-
-    # Initialize grids
-    u_grid = np.full_like(X, np.nan)
-    v_grid = np.full_like(Y, np.nan)
-    v_mag_grid = np.full_like(X, np.nan)
-
-    # Map points to grid
-    for _, row in df.iterrows():
-        i = np.argmin(np.abs(y_grid - row["y"]))
-        j = np.argmin(np.abs(x_grid - row["x"]))
-
-        u_grid[i, j] = row["u"]
-        v_grid[i, j] = row["v"]
-        v_mag_grid[i, j] = row["V"]
-
-    # Create valid mask
-    valid_mask = ~np.isnan(v_mag_grid)
-
-    logger.info(f"Created 2D grid: {X.shape}, {np.sum(valid_mask)} valid points")
-
-    return X, Y, u_grid, v_grid, v_mag_grid, valid_mask
-
-
-def apply_2d_median_filter(
-    df: pd.DataFrame,
-    window_size: int = None,
-    threshold_factor: float = None,
-    velocity_column: str = "V",
-) -> pd.DataFrame:
-    """
-    Apply 2D median filter to remove outliers based on local neighborhood.
-
-    Args:
-        df: DataFrame with DIC data containing 'x', 'y', 'u', 'v', 'V' columns
-        window_size: Size of the median filter window (odd number recommended)
-        threshold_factor: Factor for outlier detection (n * median_deviation)
-        velocity_column: Column name for velocity magnitude
-
-    Returns:
-        Filtered DataFrame
-    """
-    # Use config defaults if not provided
-    if window_size is None:
-        window_size = config.get("dic.median_window_size")
-    if threshold_factor is None:
-        threshold_factor = config.get("dic.median_threshold_factor")
-
-    logger.info(
-        f"Applying 2D median filter: window_size={window_size}, threshold_factor={threshold_factor}"
-    )
-
-    # Create 2D grid from scattered points
-    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid(df)
-
-    # Apply median filter only to valid points
-    v_mag_filtered = np.full_like(v_mag_grid, np.nan)
-
-    # Create a copy for filtering
-    v_mag_work = v_mag_grid.copy()
-    v_mag_work[~valid_mask] = np.nan
-
-    # Apply median filter
-    v_mag_median = ndimage.median_filter(v_mag_work, size=window_size)
-
-    # Calculate local median absolute deviation (MAD)
-    # MAD = median(|x_i - median(x)|)
-    mad_grid = np.abs(v_mag_work - v_mag_median)
-    mad_median = ndimage.median_filter(mad_grid, size=window_size)
-
-    # Create outlier mask
-    outlier_threshold = threshold_factor * mad_median
-    outlier_mask = np.abs(v_mag_work - v_mag_median) > outlier_threshold
-
-    # Count outliers
-    n_outliers = np.sum(outlier_mask & valid_mask)
-    logger.info(f"Detected {n_outliers} outliers in 2D median filter")
-
-    # Create list of valid point indices to keep
-    keep_indices = []
-    for idx, row in df.iterrows():
-        # Find grid position
-        i = np.argmin(np.abs(Y[:, 0] - row["y"]))
-        j = np.argmin(np.abs(X[0, :] - row["x"]))
-
-        # Check if this point should be kept
-        if not outlier_mask[i, j]:
-            keep_indices.append(idx)
-
-    # Filter DataFrame
-    df_filtered = df.iloc[keep_indices].reset_index(drop=True)
-    logger.info(
-        f"2D median filtering: {len(df)} -> {len(df_filtered)} points "
-        f"(removed {len(df) - len(df_filtered)} outliers)"
-    )
-
-    return df_filtered
-
-
-def apply_dic_filters(
-    df: pd.DataFrame,
-    filter_outliers: bool = None,
-    tails_percentile: float = None,
-    min_velocity: float = None,
-    apply_2d_median: bool = None,
-    median_window_size: int = None,
-    median_threshold_factor: float = None,
-) -> pd.DataFrame:
-    """
-    Apply all DIC data filters in sequence.
-
-    Args:
-        df: Raw DIC DataFrame
-        filter_outliers: Whether to apply percentile-based outlier filtering
-        tails_percentile: Percentile for tail filtering
-        min_velocity: Minimum velocity threshold
-        apply_2d_median: Whether to apply 2D median filter
-        median_window_size: Window size for median filter
-        median_threshold_factor: Threshold factor for median filter
-
-    Returns:
-        Filtered DataFrame
-    """
-    # Use config defaults if not provided
-    if filter_outliers is None:
-        filter_outliers = config.get("dic.filter_outliers")
-    if tails_percentile is None:
-        tails_percentile = config.get("dic.tails_percentile")
-    if min_velocity is None:
-        min_velocity = config.get("dic.min_velocity")
-    if apply_2d_median is None:
-        apply_2d_median = config.get("dic.apply_2d_median")
-    if median_window_size is None:
-        median_window_size = config.get("dic.median_window_size")
-    if median_threshold_factor is None:
-        median_threshold_factor = config.get("dic.median_threshold_factor")
-
-    logger.info(f"Starting DIC filtering pipeline with {len(df)} points")
-    df_filtered = df.copy()
-
-    # 1. Apply percentile-based outlier filtering
-    if filter_outliers:
-        df_filtered = filter_outliers_by_percentile(
-            df_filtered, tails_percentile=tails_percentile
-        )
-
-    # 2. Apply minimum velocity filtering
-    if min_velocity >= 0:
-        df_filtered = filter_by_min_velocity(df_filtered, min_velocity=min_velocity)
-
-    # 3. Apply 2D median filter
-    if apply_2d_median:
-        df_filtered = apply_2d_median_filter(
-            df_filtered,
-            window_size=median_window_size,
-            threshold_factor=median_threshold_factor,
-        )
-    logger.info(
-        f"DIC filtering pipeline completed: {len(df)} -> {len(df_filtered)} points "
-        f"(removed {len(df) - len(df_filtered)} total)"
-    )
-
-    return df_filtered
+    df_all = pd.concat(df_list, ignore_index=True)
+    logger.info(f"Total concatenated DIC data points: {len(df_all)}")
+    return df_all
 
 
 def get_image(

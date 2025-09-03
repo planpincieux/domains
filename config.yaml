@@ -34,7 +34,7 @@ dic:
 
 # GMM clustering parameters
 clustering:
-  variables_names: ["V", "angle_deg"] # ["x", "y", "magnitude", "prior_class"] # "angle_rad"
+  variables_names: ["V"] # ["x", "y", "magnitude", "prior_class"] # "angle_rad" , "angle_deg"
   n_components: 8
   weight_concentration_prior: 0.5
   max_iter: 100
