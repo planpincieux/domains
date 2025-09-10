@@ -17,6 +17,7 @@ data:
   target_date: "2024-09-02"
   camera_names: ["PPCX_Tele"]
   roi_path: "data/PPCX_Tele_glacier_ROI.json"
+  sector_prior_pattern: "data/sectors_prior/PPCX_Tele*.json"
 
 # DIC data processing parameters
 dic:
