@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
-CONFIG_PATH = Path(__file__).parents[1] / "config.yaml"
+CONFIG_PATH = Path.cwd() / "config.yaml"
 
 
 @dataclass

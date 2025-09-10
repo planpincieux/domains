@@ -31,7 +31,7 @@ def get_dic_analysis_ids(
     slave_timestamp_end: str | datetime | None = None,
     camera_id: int | None = None,
     camera_name: str | None = None,
-    time_difference_hours: int | None = None,
+    dt_hours: int | None = None,
     time_difference_min: int | None = None,
     time_difference_max: int | None = None,
     month: int | None = None,
@@ -59,7 +59,7 @@ def get_dic_analysis_ids(
         slave_timestamp_end: End of slave timestamp interval
         camera_id: Camera ID
         camera_name: Camera name
-        time_difference_hours: Exact time difference between images (hours)
+        dt_hours: Exact time difference between images (hours)
         time_difference_min: Minimum time difference (hours)
         time_difference_max: Maximum time difference (hours)
         month: Month (integer, 1-12) for reference_date
@@ -127,14 +127,14 @@ def get_dic_analysis_ids(
         params.append(camera_name)
 
     # Time difference (dt) filters
-    if time_difference_hours is not None:
-        query += " AND DIC.time_difference_hours = %s"
-        params.append(time_difference_hours)
+    if dt_hours is not None:
+        query += " AND DIC.dt_hours = %s"
+        params.append(dt_hours)
     if time_difference_min is not None:
-        query += " AND DIC.time_difference_hours >= %s"
+        query += " AND DIC.dt_hours >= %s"
         params.append(time_difference_min)
     if time_difference_max is not None:
-        query += " AND DIC.time_difference_hours <= %s"
+        query += " AND DIC.dt_hours <= %s"
         params.append(time_difference_max)
 
     # Month filter (on reference_date)
@@ -148,7 +148,7 @@ def get_dic_analysis_ids(
     if df.empty:
         logger.warning("No DIC analyses found for the given criteria")
         return []
-    logger.debug(f"Found {len(df)} DIC analyses matching criteria")
+    logger.info(f"Found {len(df)} DIC analyses matching criteria")
     return df["dic_id"].tolist()
 
 
@@ -193,7 +193,7 @@ def get_dic_analysis_by_ids(
             DIC.slave_timestamp,
             DIC.master_image_id,
             DIC.slave_image_id,
-            DIC.time_difference_hours
+            DIC.dt_hours
         FROM ppcx_app_dic DIC
         JOIN ppcx_app_image IMG ON DIC.master_image_id = IMG.id
         JOIN ppcx_app_camera CAM ON IMG.camera_id = CAM.id
@@ -237,9 +237,11 @@ def get_multi_dic_data(
     dic_ids: list[int],
     app_host: str = APP_HOST,
     app_port: str = APP_PORT,
-) -> pd.DataFrame:
+    stack_results: bool = True,
+) -> pd.DataFrame | dict[int, pd.DataFrame]:
     """
     Fetch and concatenate DIC displacement data for multiple DIC IDs.
+    Returns a single DataFrame with all DIC data if stack_results is True, otherwise returns a dictionary of DataFrames.
 
     Args:
         dic_ids: List of DIC analysis IDs
@@ -247,38 +249,35 @@ def get_multi_dic_data(
         app_port: API port (optional, defaults to config)
 
     Returns:
-        Concatenated DataFrame with all DIC data
+        DataFrame or dict: Concatenated DataFrame with all DIC data if stack_results is True, otherwise a dictionary of DataFrames.
     """
-    df_list = []
+    df_dic = {}
     for dic_id in dic_ids:
         try:
             df = get_dic_data(dic_id, app_host=app_host, app_port=app_port)
-            df_list.append(df)
+            df_dic[dic_id] = df
             logger.info(f"Fetched DIC data for id {dic_id} with {len(df)} points")
         except ValueError as e:
             logger.warning(f"Skipping DIC id {dic_id}: {e}")
 
-    if not df_list:
+    if not df_dic:
         raise ValueError("No valid DIC data found for the provided IDs")
 
-    df_all = pd.concat(df_list, ignore_index=True)
-    logger.info(f"Total concatenated DIC data points: {len(df_all)}")
-    return df_all
+    if stack_results:
+        df_stack = pd.concat(df_dic.values(), ignore_index=True)
+        logger.info(f"Total concatenated DIC data points: {len(df_stack)}")
+        return df_stack
+    else:
+        return df_dic
 
 
 def get_image(
     image_id: int,
-    app_host: str = None,
-    app_port: str = None,
+    app_host: str = APP_HOST,
+    app_port: str = APP_PORT,
     camera_name: str | None = None,
 ) -> Image.Image:
     """Get an image from the database by its ID and rotate if from Tele camera."""
-    # Use config defaults if not provided
-    if app_host is None:
-        app_host = config.get("api.host")
-    if app_port is None:
-        app_port = config.get("api.port")
-
     url = f"http://{app_host}:{app_port}/API/images/{image_id}/"
     response = requests.get(url)
     if response.status_code == 200:

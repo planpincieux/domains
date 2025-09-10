@@ -5,21 +5,17 @@ import pandas as pd
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from src.config import ConfigManager
-
 logger = logging.getLogger(__name__)
-
-config = ConfigManager()
 
 
 def apply_dic_filters(
     df: pd.DataFrame,
-    filter_outliers: bool | None = None,
-    tails_percentile: float | None = None,
-    min_velocity: float | None = None,
-    apply_2d_median: bool | None = None,
-    median_window_size: int | None = None,
-    median_threshold_factor: float | None = None,
+    filter_outliers: bool | None = True,
+    tails_percentile: float | None = 0.01,
+    min_velocity: float | None = 0.0,
+    apply_2d_median: bool | None = False,
+    median_window_size: int | None = 5,
+    median_threshold_factor: float | None = 3.0,
 ) -> pd.DataFrame:
     """
     Apply all DIC data filters in sequence.
@@ -36,31 +32,18 @@ def apply_dic_filters(
     Returns:
         Filtered DataFrame
     """
-    # Use config defaults if not provided
-    if filter_outliers is None:
-        filter_outliers = config.get("dic.filter_outliers")
-    if tails_percentile is None:
-        tails_percentile = config.get("dic.tails_percentile")
-    if min_velocity is None:
-        min_velocity = config.get("dic.min_velocity")
-    if apply_2d_median is None:
-        apply_2d_median = config.get("dic.apply_2d_median")
-    if median_window_size is None:
-        median_window_size = config.get("dic.median_window_size")
-    if median_threshold_factor is None:
-        median_threshold_factor = config.get("dic.median_threshold_factor")
 
     logger.info(f"Starting DIC filtering pipeline with {len(df)} points")
     df_filtered = df.copy()
 
     # 1. Apply percentile-based outlier filtering
-    if filter_outliers:
+    if filter_outliers and tails_percentile is not None and tails_percentile > 0:
         df_filtered = filter_outliers_by_percentile(
             df_filtered, tails_percentile=tails_percentile
         )
 
     # 2. Apply minimum velocity filtering
-    if min_velocity >= 0:
+    if min_velocity is not None and min_velocity >= 0:
         df_filtered = filter_by_min_velocity(df_filtered, min_velocity=min_velocity)
 
     # 3. Apply 2D median filter
@@ -193,8 +176,8 @@ def create_2d_grid(df: pd.DataFrame, grid_spacing: float = None) -> tuple:
 
 def apply_2d_median_filter(
     df: pd.DataFrame,
-    window_size: int | None = None,
-    threshold_factor: float | None = None,
+    window_size: int | None = 5,
+    threshold_factor: float | None = 3.0,
     velocity_column: str = "V",
 ) -> pd.DataFrame:
     """
@@ -209,12 +192,6 @@ def apply_2d_median_filter(
     Returns:
         Filtered DataFrame
     """
-    # Use config defaults if not provided
-    if window_size is None:
-        window_size = config.get("dic.median_window_size")
-    if threshold_factor is None:
-        threshold_factor = config.get("dic.median_threshold_factor")
-
     logger.info(
         f"Applying 2D median filter: window_size={window_size}, threshold_factor={threshold_factor}"
     )

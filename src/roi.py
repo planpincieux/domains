@@ -7,65 +7,133 @@ from matplotlib.widgets import PolygonSelector
 
 
 class PolygonROISelector:
-    """Interactive polygon selector for defining regions of interest on images."""
+    """Interactive polygon selector for defining regions of interest on images.
+
+    This class no longer launches an interactive selector at construction.
+    Use start_interactive(...) to run the GUI, or set/load a polygon programmatically
+    with set_polygon(...) / load_from_file(...). Use create_mask(...) or
+    contains_points(...) to obtain boolean masks compatible with DataFrame filtering.
+
+    Attributes:
+        polygon_points: List of (x,y) tuples defining the polygon vertices.
+        polygon_path: Matplotlib Path object for the polygon.
+        file_path: Optional path to save/load polygon points as JSON.
+        image: Optional background image for interactive selection.
+    """
 
     def __init__(
         self,
-        image=None,
-        title="Select ROI polygon",
-        polygon_points=None,
-        file_path=None,
+        polygon_points: list[tuple[float, float]] | None = None,
+        file_path: str = "polygon_roi.json",
     ):
-        self.image = image
-        self.polygon_points = polygon_points or []
+        """
+        Initialize the PolygonROISelector.
+        Args:
+            polygon_points: Optional initial list of (x,y) tuples for the polygon.
+            file_path: Optional path to save/load polygon points as JSON.
+        """
+        self.polygon_points = list(polygon_points or [])
         self.polygon_path = None
         self.file_path = file_path
+        self.fig = None
+        self.ax = None
+        self.polygon_selector = None
 
         if self.polygon_points and len(self.polygon_points) >= 3:
             self.polygon_path = MplPath(self.polygon_points)
 
-        if image is not None and not self.polygon_points:
-            # Create figure and axis
-            self.fig, self.ax = plt.subplots(figsize=(10, 8))
-            self.ax.imshow(image, alpha=0.8)
-            self.ax.set_title(
-                f"{title}\nClick to add points, press Enter to finish. Click 'MAIUSC+S' to save polygon points to a json file."
-            )
+    @classmethod
+    def from_file(cls, file_path):
+        """Construct selector from file without launching interactive UI."""
+        selector = cls(polygon_points=None, file_path=file_path)
+        return selector.load_from_file(file_path)
 
-            # Initialize polygon selector
-            self.polygon_selector = PolygonSelector(
-                self.ax, self.on_polygon_select, useblit=True
-            )
+    # --- Interactive helpers (call explicitly) ---
+    def draw_interactive(self, image=None, useblit: bool = True):
+        """Start interactive polygon selection. Blocks until closed.
 
-            # Connect events
-            self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
-            plt.show()
+        Args:
+            image: Optional background image (2D or 3D array) to display.
+            useblit: Whether to use blitting for faster drawing (default True).
+        """
+        if image is not None:
+            self.image = image
 
-    def on_polygon_select(self, verts):
-        """Callback when polygon is selected."""
+        self.fig, self.ax = plt.subplots(figsize=(10, 8))
+        if self.image is not None:
+            self.ax.imshow(self.image, alpha=0.8)
+        self.ax.set_title(
+            f"Select ROI polygon\nClick to add points, press Enter to finish. Output path: {self.file_path}.",
+            fontsize=10,
+        )
+
+        # Initialize polygon selector using internal callback
+        self.polygon_selector = PolygonSelector(
+            self.ax, self._on_polygon_select, useblit=useblit
+        )
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
+        plt.show()
+
+    def _on_polygon_select(self, verts):
+        """Internal callback when polygon selector finishes or updates."""
         self.polygon_points = list(verts)
         if len(self.polygon_points) >= 3:
             self.polygon_path = MplPath(self.polygon_points)
-            print(f"Polygon selected with {len(self.polygon_points)} vertices")
+        print(f"Polygon updated: {len(self.polygon_points)} vertices")
 
-    def on_key_press(self, event):
-        """Handle key press events."""
+    def _on_key_press(self, event):
+        """Handle key press events for the interactive selector."""
+        # finish selection
+        import contextlib
+
         if event.key == "enter":
             if len(self.polygon_points) >= 3:
                 print("Polygon selection completed!")
-                plt.close(self.fig)
+                if self.file_path:
+                    self.to_file(self.file_path)
+                    print(f"Polygon points saved to {self.file_path}")
+                # Close the figure to end interaction
+                with contextlib.suppress(Exception):
+                    plt.close(self.fig)
             else:
                 print("Need at least 3 points to form a polygon")
         elif event.key == "escape":
             print("Polygon selection cancelled")
-            plt.close(self.fig)
+            with contextlib.suppress(Exception):
+                plt.close(self.fig)
 
-        if event.key == "S":
-            """Save the polygon points to a file."""
-            if self.file_path:
-                self.to_file(self.file_path)
-            else:
-                print("No file path specified for saving polygon points")
+    def filter_dataframe(self, df, x_col="x", y_col="y"):
+        """Filter the dataframe to keep only points inside the polygon."""
+        if self.polygon_path is None:
+            print("No polygon defined, returning original dataframe")
+            return df
+        if x_col not in df.columns or y_col not in df.columns:
+            raise ValueError(f"DataFrame must contain columns '{x_col}' and '{y_col}'")
+        mask = self.create_mask(df=df, x_col=x_col, y_col=y_col)
+        filtered_df = df[mask].reset_index(drop=True)
+        print(f"Filtered {len(df)} points to {len(filtered_df)} points inside polygon")
+        return filtered_df
+
+    def visualize(self, df, img=None, figsize=(12, 5)):
+        """Visualize polygon overlaid on data (non-interactive)."""
+        visualize_polygon_filter(df, self, img, figsize=figsize)
+
+    # --- Programmatic polygon management ---
+    def set_polygon(self, points):
+        """Set polygon points programmatically (list of (x,y) pairs)."""
+        self.polygon_points = list(points)
+        if len(self.polygon_points) >= 3:
+            self.polygon_path = MplPath(self.polygon_points)
+        else:
+            self.polygon_path = None
+
+    # --- Mask / filtering utilities ---
+    def contains_points(self, x, y):
+        """Return a boolean mask for points (x, y) inside the polygon."""
+        if self.polygon_path is None:
+            return np.zeros_like(x, dtype=bool)
+        points = np.column_stack([x, y])
+        return self.polygon_path.contains_points(points)
 
     def to_file(self, path):
         """Save the selector's polygon points to a JSON file."""
@@ -78,30 +146,60 @@ class PolygonROISelector:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.suffix:
             path = path.with_suffix(".json")
-        data = {
-            "polygon_points": self.polygon_points,
-        }
+        data = {"polygon_points": self.polygon_points}
         with open(path, "w") as f:
             json.dump(data, f)
+        self.file_path = str(path)
         print(f"Polygon selector saved to {path}")
 
-    @classmethod
-    def from_file(cls, path, image=None, title="Select ROI polygon"):
-        """Load a selector from a JSON file. Optionally attach an image for visualization."""
+    def load_from_file(self, path):
+        """Load polygon points from a JSON file and set them on this selector."""
         import json
 
         path = Path(path)
         with open(path) as f:
             data = json.load(f)
         polygon_points = data.get("polygon_points", [])
-        return cls(image=image, title=title, polygon_points=polygon_points)
+        self.set_polygon(polygon_points)
+        self.file_path = str(path)
+        return self
 
-    def contains_points(self, x, y):
-        """Return a boolean mask for points (x, y) inside the polygon."""
+    def create_mask(
+        self,
+        points: np.ndarray | None = None,
+        x_col: str | None = None,
+        y_col: str | None = None,
+        df=None,
+    ):
+        """
+        Create boolean mask for a set of points.
+
+        - points: Nx2 array of (x,y) coordinates
+        - or provide a pandas DataFrame via df with columns x_col and y_col
+        """
         if self.polygon_path is None:
-            return np.zeros_like(x, dtype=bool)
-        points = np.column_stack([x, y])
-        return self.polygon_path.contains_points(points)
+            # If no polygon, return mask of all False (no points selected)
+            if df is not None:
+                return np.zeros(len(df), dtype=bool)
+            if points is not None:
+                return np.zeros(len(points), dtype=bool)
+            return np.array([], dtype=bool)
+
+        if df is not None:
+            if x_col is None or y_col is None:
+                raise ValueError(
+                    "x_col and y_col must be provided when passing a DataFrame"
+                )
+            pts = df[[x_col, y_col]].values
+            return self.polygon_path.contains_points(pts)
+
+        if points is not None:
+            pts = np.asarray(points)
+            if pts.ndim != 2 or pts.shape[1] != 2:
+                raise ValueError("points must be an Nx2 array")
+            return self.polygon_path.contains_points(pts)
+
+        raise ValueError("Either points or df must be provided to create_mask")
 
 
 def points_inside_polygon(polygon_path, points) -> np.ndarray:
