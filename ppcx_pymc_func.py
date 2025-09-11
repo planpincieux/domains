@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -207,11 +208,23 @@ def plot_1d_velocity_clustering(
     cluster_pred,
     posterior_probs,
     scaler=None,
-):
+) -> tuple[Any, np.ndarray]:
     """
     Plot 1D velocity clustering results for marginalized model.
     - cluster_pred: array of cluster assignments (from responsibilities, not z samples)
     - posterior_probs: (n_points, k) assignment probabilities for each point
+
+    Parameters
+    - df_features: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
+    - img: optional background image (2D/3D array) to show under the scatter
+    - idata: arviz InferenceData from marginalized model (must contain "mu" and "sigma")
+    - cluster_pred: (n_points,) hard labels = argmax_k posterior_probs
+    - posterior_probs: (n_points, k) averaged responsibilities
+    - scaler: optional StandardScaler used to scale the velocity feature (for inverse transform)
+
+    Returns
+    - fig, uncertainty: matplotlib figure and (n_points,) entropy of posterior_probs
+
     """
 
     # Compute uncertainty (entropy) for each point
@@ -219,8 +232,10 @@ def plot_1d_velocity_clustering(
     max_probs = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
 
     # Get model parameters
-    mu_posterior = idata.posterior["μ"].mean(dim=["chain", "draw"]).values.flatten()
-    sigma_posterior = idata.posterior["σ"].mean(dim=["chain", "draw"]).values.flatten()
+    mu_posterior = idata.posterior["mu"].mean(dim=["chain", "draw"]).values.flatten()
+    sigma_posterior = (
+        idata.posterior["sigma"].mean(dim=["chain", "draw"]).values.flatten()
+    )
 
     # Distinct colors
     unique_labels = np.unique(cluster_pred)
