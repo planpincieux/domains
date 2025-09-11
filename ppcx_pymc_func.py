@@ -28,6 +28,77 @@ def assign_spatial_priors(df, sectors, prior_strength=0.8):
     return prior_probs
 
 
+def plot_spatial_priors(
+    df,
+    prior_probs,
+    img=None,
+    cmap="Reds",
+    point_size=1,
+    alpha=0.7,
+    figsize_per_panel=(4, 4),
+):
+    """
+    Plot spatial prior probability maps for each cluster.
+
+    Parameters
+    - df: DataFrame with columns 'x' and 'y' for point coordinates
+    - prior_probs: array-like shape (n_points, k) with prior probability for each cluster
+    - img: optional background image (2D/3D array) to show under the scatter
+    - cmap: colormap for priors (default 'Reds')
+    - point_size: scatter point size
+    - alpha: scatter alpha
+    - figsize_per_panel: tuple (width, height) per panel in inches
+
+    Returns
+    - fig, axes: matplotlib figure and axes array
+    """
+
+    prior_probs = np.asarray(prior_probs)
+    n_points, k = prior_probs.shape
+
+    nrows = int(np.ceil(np.sqrt(k)))
+    ncols = int(np.ceil(k / nrows))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+    )
+    # Normalize axes to flat list for easy indexing
+    if isinstance(axes, np.ndarray):
+        axes_flat = axes.flatten()
+    else:
+        axes_flat = [axes]
+
+    for cluster in range(k):
+        ax = axes_flat[cluster]
+        if img is not None:
+            ax.imshow(img, alpha=0.3)
+        scatter = ax.scatter(
+            df["x"],
+            df["y"],
+            c=prior_probs[:, cluster],
+            cmap=cmap,
+            s=point_size,
+            alpha=alpha,
+            vmin=0,
+            vmax=1,
+        )
+        ax.set_title(f"Prior for Cluster {cluster}")
+        ax.xaxis.set_ticks([])
+        ax.yaxis.set_ticks([])
+        plt.colorbar(scatter, ax=ax)
+
+    # Hide any unused axes
+    total_panels = nrows * ncols
+    if total_panels > k:
+        for ia in range(k, total_panels):
+            axes_flat[ia].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
 def compute_posterior_assignments(
     idata,
     X_scaled,

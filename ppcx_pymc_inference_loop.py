@@ -102,7 +102,7 @@ for date in dates:
 
         # compute assignments for new single-day data (fast option using posterior mean)
         posterior_probs, cluster_pred, uncertainty = compute_posterior_assignments(
-            idata, X_scaled, prior_probs, use_posterior_mean=True
+            idata, X_scaled, prior_probs, use_posterior_mean=False
         )
 
         # Plot results
