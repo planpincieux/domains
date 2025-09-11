@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -112,12 +113,12 @@ def compute_posterior_assignments(
     Compute assignment probabilities, hard labels and uncertainty for a marginalized model.
 
     Parameters
-    - idata: arviz InferenceData from marginalized model (must contain "μ" and "σ")
+    - idata: arviz InferenceData from marginalized model (must contain "mu" and "sigma")
     - X_scaled: (n_points, n_features) array used for inference (can be new single-day data)
     - prior_probs: (n_points, k) spatial priors for the same X_scaled rows
     - n_posterior_samples: if int, randomly subsample this many posterior draws for Monte Carlo
       (default: use all draws). Use to speed-up computation on large datasets.
-    - use_posterior_mean: if True, compute responsibilities using posterior mean μ/σ (cheap).
+    - use_posterior_mean: if True, compute responsibilities using posterior mean mu/sigma (cheap).
     - random_seed: RNG seed for subsampling posterior draws.
 
     Returns
@@ -126,9 +127,9 @@ def compute_posterior_assignments(
     - uncertainty: (n_points,) entropy of posterior_probs
     """
 
-    # Extract posterior μ and σ
-    mu_samples = idata.posterior["μ"].values  # (chains, draws, k, n_features)
-    sigma_samples = idata.posterior["σ"].values
+    # Extract posterior mu and sigma
+    mu_samples = idata.posterior["mu"].values  # (chains, draws, k, n_features)
+    sigma_samples = idata.posterior["sigma"].values
 
     # collapse chain/draw dims
     S_full = mu_samples.shape[0] * mu_samples.shape[1]
@@ -207,11 +208,23 @@ def plot_1d_velocity_clustering(
     cluster_pred,
     posterior_probs,
     scaler=None,
-):
+) -> tuple[Any, np.ndarray]:
     """
     Plot 1D velocity clustering results for marginalized model.
     - cluster_pred: array of cluster assignments (from responsibilities, not z samples)
     - posterior_probs: (n_points, k) assignment probabilities for each point
+
+    Parameters
+    - df_features: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
+    - img: optional background image (2D/3D array) to show under the scatter
+    - idata: arviz InferenceData from marginalized model (must contain "mu" and "sigma")
+    - cluster_pred: (n_points,) hard labels = argmax_k posterior_probs
+    - posterior_probs: (n_points, k) averaged responsibilities
+    - scaler: optional StandardScaler used to scale the velocity feature (for inverse transform)
+
+    Returns
+    - fig, uncertainty: matplotlib figure and (n_points,) entropy of posterior_probs
+
     """
 
     # Compute uncertainty (entropy) for each point
@@ -219,8 +232,10 @@ def plot_1d_velocity_clustering(
     max_probs = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
 
     # Get model parameters
-    mu_posterior = idata.posterior["μ"].mean(dim=["chain", "draw"]).values.flatten()
-    sigma_posterior = idata.posterior["σ"].mean(dim=["chain", "draw"]).values.flatten()
+    mu_posterior = idata.posterior["mu"].mean(dim=["chain", "draw"]).values.flatten()
+    sigma_posterior = (
+        idata.posterior["sigma"].mean(dim=["chain", "draw"]).values.flatten()
+    )
 
     # Distinct colors
     unique_labels = np.unique(cluster_pred)
