@@ -4,6 +4,7 @@ from pathlib import Path
 import arviz as az
 import joblib
 import matplotlib.pyplot as plt
+import pandas as pd
 from sqlalchemy import create_engine
 
 from ppcluster import logger
@@ -32,15 +33,19 @@ plt.switch_backend("Agg")
 config = ConfigManager()
 db_engine = create_engine(config.db_url)
 
-dates = [
-    "2024-09-01",
-    "2024-09-02",
-    "2024-09-03",
-    "2024-09-04",
-    "2024-09-05",
-    "2024-09-06",
-    "2024-09-07",
-]
+# Define a range of dates to process
+# dates = [
+#     "2024-09-01",
+#     "2024-09-02",
+#     "2024-09-03",
+#     "2024-09-04",
+#     "2024-09-05",
+#     "2024-09-06",
+#     "2024-09-07",
+# ]
+date_in = "2024-08-23"
+date_end = "2024-09-07"
+dates = pd.date_range(start=date_in, end=date_end).strftime("%Y-%m-%d").tolist()
 
 camera_name = "PPCX_Tele"
 output_dir = Path("output") / f"{camera_name}_PyMC"
