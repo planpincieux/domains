@@ -6,8 +6,8 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 from sklearn.preprocessing import StandardScaler
 
-RANDOM_SEED = 8927
 logger = logging.getLogger("ppcx")
+RANDOM_SEED = 8927
 
 
 def preproc_features(df):

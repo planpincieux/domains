@@ -10,11 +10,38 @@ from ppcluster.config import ConfigManager
 
 logger = logging.getLogger("ppcx")
 
-config = ConfigManager()
 
-APP_HOST = config.get("api.host")
-APP_PORT = config.get("api.port")
-GET_IMAGE_VIEW = config.get("api.image_view")
+def _resolve_api_host_port(
+    app_host: str | None,
+    app_port: str | None,
+    config: ConfigManager | None,
+) -> tuple[str, str]:
+    """
+    Resolve API host/port from explicit args or a ConfigManager.
+    Priority: if kwargs (app_host/app_port) are passed, they override config values.
+    """
+    host = config.get("api.host") if config is not None else None
+    port = config.get("api.port") if config is not None else None
+
+    # kwargs override config
+    if app_host is not None:
+        if config is not None and host is not None and host != app_host:
+            logger.debug(
+                f"Overriding api.host from config with provided app_host '{app_host}' (config had '{host}')"
+            )
+        host = app_host
+    if app_port is not None:
+        if config is not None and port is not None and str(port) != str(app_port):
+            logger.debug(
+                f"Overriding api.port from config with provided app_port '{app_port}' (config had '{port}')"
+            )
+        port = app_port
+
+    if host is None or port is None:
+        raise ValueError(
+            "API host/port not provided. Pass app_host/app_port or a ConfigManager with api.host/api.port."
+        )
+    return str(host), str(port)
 
 
 def get_dic_analysis_ids(
@@ -204,13 +231,18 @@ def get_dic_analysis_by_ids(
 
 def get_dic_data(
     dic_id: int,
-    app_host: str = APP_HOST,
-    app_port: str = APP_PORT,
+    *,
+    app_host: str | None = None,
+    app_port: str | None = None,
+    config: ConfigManager | None = None,
 ) -> pd.DataFrame:
     """
     Fetch DIC displacement data from the Django API endpoint as a DataFrame.
+
+    Provide either app_host/app_port explicitly or a ConfigManager (config) containing api.host/api.port.
     """
-    url = f"http://{app_host}:{app_port}/API/dic/{dic_id}/"
+    host, port = _resolve_api_host_port(app_host, app_port, config)
+    url = f"http://{host}:{port}/API/dic/{dic_id}/"
     response = requests.get(url)
     if response.status_code != 200:
         raise ValueError(f"Could not fetch DIC data for id {dic_id}: {response.text}")
@@ -235,9 +267,11 @@ def get_dic_data(
 
 def get_multi_dic_data(
     dic_ids: list[int],
-    app_host: str = APP_HOST,
-    app_port: str = APP_PORT,
+    *,
     stack_results: bool = True,
+    app_host: str | None = None,
+    app_port: str | None = None,
+    config: ConfigManager | None = None,
 ) -> pd.DataFrame | dict[int, pd.DataFrame]:
     """
     Fetch and concatenate DIC displacement data for multiple DIC IDs.
@@ -251,10 +285,12 @@ def get_multi_dic_data(
     Returns:
         DataFrame or dict: Concatenated DataFrame with all DIC data if stack_results is True, otherwise a dictionary of DataFrames.
     """
-    df_dic = {}
+    host, port = _resolve_api_host_port(app_host, app_port, config)
+
+    df_dic: dict[int, pd.DataFrame] = {}
     for dic_id in dic_ids:
         try:
-            df = get_dic_data(dic_id, app_host=app_host, app_port=app_port)
+            df = get_dic_data(dic_id, app_host=host, app_port=port)
             df_dic[dic_id] = df
             logger.info(f"Fetched DIC data for id {dic_id} with {len(df)} points")
         except ValueError as e:
@@ -273,12 +309,18 @@ def get_multi_dic_data(
 
 def get_image(
     image_id: int,
-    app_host: str = APP_HOST,
-    app_port: str = APP_PORT,
+    *,
     camera_name: str | None = None,
+    app_host: str | None = None,
+    app_port: str | None = None,
+    config: ConfigManager | None = None,
 ) -> Image.Image:
-    """Get an image from the database by its ID and rotate if from Tele camera."""
-    url = f"http://{app_host}:{app_port}/API/images/{image_id}/"
+    """
+    Get an image by ID from the API and rotate if from Tele camera.
+    Provide either app_host/app_port or a ConfigManager (config).
+    """
+    host, port = _resolve_api_host_port(app_host, app_port, config)
+    url = f"http://{host}:{port}/API/images/{image_id}/"
     response = requests.get(url)
     if response.status_code == 200:
         img = Image.open(io.BytesIO(response.content))

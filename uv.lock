@@ -1150,6 +1150,7 @@ name = "ppcluster"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "arviz" },
     { name = "cmcrameri" },
     { name = "dotenv" },
     { name = "exifread" },
@@ -1177,6 +1178,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arviz", specifier = ">=0.22.0" },
     { name = "cmcrameri", specifier = ">=1.9" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "exifread", specifier = ">=3.3.1" },

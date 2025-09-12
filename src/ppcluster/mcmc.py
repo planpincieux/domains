@@ -6,9 +6,9 @@ from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
 from scipy.stats import norm as scipy_norm
 
+logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
 rng = np.random.default_rng(RANDOM_SEED)
-logger = logging.getLogger("ppcx")
 
 
 def assign_spatial_priors(df, sectors, prior_strength=0.8):

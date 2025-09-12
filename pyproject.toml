@@ -10,6 +10,7 @@ authors = [{ name = "Francesco Ioli", email = "francescoioli@cnr.it" }]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "arviz>=0.22.0",
     "cmcrameri>=1.9",
     "dotenv>=0.9.9",
     "exifread>=3.3.1",
