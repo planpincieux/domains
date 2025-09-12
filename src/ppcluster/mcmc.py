@@ -1,9 +1,14 @@
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
 from matplotlib.colors import Normalize
+from matplotlib.figure import Figure
+from PIL import Image
 from scipy.stats import norm as scipy_norm
 
 logger = logging.getLogger("ppcx")
@@ -11,8 +16,25 @@ RANDOM_SEED = 8927
 rng = np.random.default_rng(RANDOM_SEED)
 
 
-def assign_spatial_priors(df, sectors, prior_strength=0.8):
-    """Assign spatial prior probabilities based on polygon sectors."""
+def assign_spatial_priors(
+    df: pd.DataFrame,
+    sectors: Sequence[Any],
+    prior_strength: float = 0.8,
+) -> np.ndarray:
+    """Assign spatial prior probabilities based on polygon sectors.
+
+    Args:
+        df: DataFrame with at least columns ``x`` and ``y`` containing point coordinates.
+        sectors: Sequence of region objects exposing ``contains_points(x, y) -> np.ndarray[bool]``.
+            Typically matplotlib Path-like or custom objects with the same API.
+        prior_strength: Probability mass assigned to the preferred cluster when a point is
+            inside a sector (in ``[0, 1]``). The remaining mass is spread uniformly over
+            the other clusters.
+
+    Returns:
+        np.ndarray: Array of shape ``(n_points, k)`` with prior probabilities per observation
+        and cluster.
+    """
     ndata = len(df)
     k = len(sectors)
     prior_probs = np.ones((ndata, k)) / k  # default uniform
@@ -30,28 +52,27 @@ def assign_spatial_priors(df, sectors, prior_strength=0.8):
 
 
 def plot_spatial_priors(
-    df,
-    prior_probs,
-    img=None,
-    cmap="Reds",
-    point_size=1,
-    alpha=0.7,
-    figsize_per_panel=(4, 4),
-):
-    """
-    Plot spatial prior probability maps for each cluster.
+    df: pd.DataFrame,
+    prior_probs: np.ndarray,
+    img: np.ndarray | None = None,
+    cmap: str = "Reds",
+    point_size: float = 1,
+    alpha: float = 0.7,
+    figsize_per_panel: tuple[float, float] = (4, 4),
+) -> tuple[Figure, np.ndarray | Axes]:
+    """Plot spatial prior probability maps for each cluster.
 
-    Parameters
-    - df: DataFrame with columns 'x' and 'y' for point coordinates
-    - prior_probs: array-like shape (n_points, k) with prior probability for each cluster
-    - img: optional background image (2D/3D array) to show under the scatter
-    - cmap: colormap for priors (default 'Reds')
-    - point_size: scatter point size
-    - alpha: scatter alpha
-    - figsize_per_panel: tuple (width, height) per panel in inches
+    Args:
+        df: DataFrame with columns ``x`` and ``y`` for point coordinates.
+        prior_probs: Array of shape ``(n_points, k)`` with prior probabilities per cluster.
+        img: Optional background image array to show under the scatter.
+        cmap: Colormap name for priors (default ``'Reds'``).
+        point_size: Scatter point size.
+        alpha: Scatter alpha.
+        figsize_per_panel: Tuple ``(width, height)`` per panel in inches.
 
-    Returns
-    - fig, axes: matplotlib figure and axes array
+    Returns:
+        Tuple[Figure, Union[np.ndarray, Axes]]: Matplotlib figure and axes grid.
     """
 
     prior_probs = np.asarray(prior_probs)
@@ -65,10 +86,7 @@ def plot_spatial_priors(
         figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
     )
     # Normalize axes to flat list for easy indexing
-    if isinstance(axes, np.ndarray):
-        axes_flat = axes.flatten()
-    else:
-        axes_flat = [axes]
+    axes_flat = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
 
     for cluster in range(k):
         ax = axes_flat[cluster]
@@ -101,30 +119,32 @@ def plot_spatial_priors(
 
 
 def compute_posterior_assignments(
-    idata,
-    X_scaled,
-    prior_probs,
+    idata: Any,
+    X_scaled: np.ndarray,
+    prior_probs: np.ndarray,
     *,
-    n_posterior_samples=None,
-    use_posterior_mean=False,
-    random_seed=RANDOM_SEED,
-):
-    """
-    Compute assignment probabilities, hard labels and uncertainty for a marginalized model.
+    n_posterior_samples: int | None = None,
+    use_posterior_mean: bool = False,
+    random_seed: int = RANDOM_SEED,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute posterior responsibilities, hard labels, and uncertainty.
 
-    Parameters
-    - idata: arviz InferenceData from marginalized model (must contain "mu" and "sigma")
-    - X_scaled: (n_points, n_features) array used for inference (can be new single-day data)
-    - prior_probs: (n_points, k) spatial priors for the same X_scaled rows
-    - n_posterior_samples: if int, randomly subsample this many posterior draws for Monte Carlo
-      (default: use all draws). Use to speed-up computation on large datasets.
-    - use_posterior_mean: if True, compute responsibilities using posterior mean mu/sigma (cheap).
-    - random_seed: RNG seed for subsampling posterior draws.
+    Args:
+        idata: ArviZ ``InferenceData`` from marginalized model (must contain variables
+            ``mu`` and ``sigma`` in ``idata.posterior`` with dims ``(chain, draw, k, d)``).
+        X_scaled: Array of shape ``(n_points, n_features)`` used for inference.
+        prior_probs: Array of shape ``(n_points, k)`` with spatial priors for each point.
+        n_posterior_samples: If provided, randomly subsample this many posterior draws
+            to approximate responsibilities; otherwise use all draws.
+        use_posterior_mean: If True, compute responsibilities using posterior mean
+            of ``mu`` and ``sigma`` (faster, deterministic).
+        random_seed: RNG seed used when subsampling posterior draws.
 
-    Returns
-    - posterior_probs: (n_points, k) averaged responsibilities
-    - cluster_pred: (n_points,) hard labels = argmax_k posterior_probs
-    - uncertainty: (n_points,) entropy of posterior_probs
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - posterior_probs: ``(n_points, k)`` averaged responsibilities.
+            - cluster_pred: ``(n_points,)`` hard labels (argmax over clusters).
+            - uncertainty: ``(n_points,)`` entropy of responsibilities per point.
     """
 
     # Extract posterior mu and sigma
@@ -200,38 +220,141 @@ def compute_posterior_assignments(
     return posterior_probs, cluster_pred, uncertainty
 
 
-def plot_1d_velocity_clustering(
-    df_features,
-    img,
+def compute_cluster_statistics(
+    df_features: pd.DataFrame,
+    cluster_pred: np.ndarray,
+    posterior_probs: np.ndarray,
     *,
-    idata,
-    cluster_pred,
-    posterior_probs,
-    scaler=None,
-) -> tuple[Any, np.ndarray]:
+    idata: Any | None = None,
+    scaler: Any | None = None,
+    feature_index: int = 0,
+) -> dict[int, dict[str, float]]:
     """
-    Plot 1D velocity clustering results for marginalized model.
-    - cluster_pred: array of cluster assignments (from responsibilities, not z samples)
-    - posterior_probs: (n_points, k) assignment probabilities for each point
+    Compute per-cluster statistics independently of plotting.
 
-    Parameters
-    - df_features: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
-    - img: optional background image (2D/3D array) to show under the scatter
-    - idata: arviz InferenceData from marginalized model (must contain "mu" and "sigma")
-    - cluster_pred: (n_points,) hard labels = argmax_k posterior_probs
-    - posterior_probs: (n_points, k) averaged responsibilities
-    - scaler: optional StandardScaler used to scale the velocity feature (for inverse transform)
+    Args:
+        df_features: DataFrame with columns ``x``, ``y``, and ``V`` (velocity magnitude).
+        cluster_pred: Array ``(n_points,)`` with hard labels per point.
+        posterior_probs: Array ``(n_points, k)`` with responsibilities.
+        idata: Optional ArviZ ``InferenceData`` to compute model posterior means for
+            ``mu`` and ``sigma`` (reported as ``model_mu``/``model_sigma`` for the
+            selected feature).
+        scaler: Optional scaler to inverse-transform the selected feature (applied to
+            model parameters if provided).
+        feature_index: Feature index to report ``μ/σ`` for (default ``0``).
 
-    Returns
-    - fig, uncertainty: matplotlib figure and (n_points,) entropy of posterior_probs
+    Returns:
+        Dict[int, Dict[str, float]]: Mapping cluster_id to statistics, including keys:
+            ``count``, ``x_mean``, ``y_mean``, ``x_std``, ``y_std``,
+            ``velocity_mean``, ``velocity_std``, ``velocity_median``, ``velocity_nmad``,
+            ``avg_entropy``, ``avg_assignment_prob``, ``model_mu``, ``model_sigma``.
+    """
+    # Per-point entropy_pt and max posterior prob
+    entropy_pt = -np.sum(posterior_probs * np.log(posterior_probs + 1e-12), axis=1)
+    max_prob_pt = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
 
+    # Optional model μ/σ from posterior means
+    model_mu = None
+    model_sigma = None
+    if idata is not None and "mu" in idata.posterior and "sigma" in idata.posterior:
+        mu_arr = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
+        sigma_arr = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
+        # Ensure shapes (k, n_features)
+        if mu_arr.ndim == 1:
+            mu_arr = mu_arr[:, None]
+            sigma_arr = sigma_arr[:, None]
+        # Select requested feature
+        model_mu = mu_arr[:, feature_index].copy()
+        model_sigma = sigma_arr[:, feature_index].copy()
+        # Optionally inverse-transform
+        if scaler is not None:
+            # Inverse-transform μ: expects shape (n_samples, n_features)
+            mu_sel = mu_arr[:, [feature_index]]
+            model_mu = scaler.inverse_transform(mu_sel)[:, 0]
+            # Scale σ with feature scale (Robust/Standard scalers expose scale_)
+            scale_vec = getattr(scaler, "scale_", None)
+            if scale_vec is not None:
+                model_sigma = model_sigma * scale_vec[feature_index]
+
+    velocity = df_features["V"].to_numpy()
+    stats: dict[int, dict[str, float]] = {}
+    for label in np.unique(cluster_pred):
+        mask = cluster_pred == label
+        count = int(mask.sum())
+        if count == 0:
+            continue
+
+        v_vals = velocity[mask]
+        v_mean = float(v_vals.mean())
+        v_std = float(v_vals.std())
+        v_median = float(np.median(v_vals))
+        nmad = float(np.median(np.abs(v_vals - v_median)) * 1.4826)
+
+        x_vals = np.asarray(df_features.loc[mask, "x"])  # Series -> ndarray
+        y_vals = np.asarray(df_features.loc[mask, "y"])  # Series -> ndarray
+        x_mean = float(x_vals.mean())
+        y_mean = float(y_vals.mean())
+        x_std = float(x_vals.std())
+        y_std = float(y_vals.std())
+        avg_entropy = float(entropy_pt[mask].mean())
+        avg_prob = float(max_prob_pt[mask].mean())
+
+        entry = {
+            "count": count,
+            "x_mean": x_mean,
+            "y_mean": y_mean,
+            "x_std": x_std,
+            "y_std": y_std,
+            "velocity_mean": v_mean,
+            "velocity_std": v_std,
+            "velocity_median": v_median,
+            "velocity_nmad": nmad,
+            "avg_entropy": avg_entropy,
+            "avg_assignment_prob": avg_prob,
+            "model_mu": None,
+            "model_sigma": None,
+        }
+        if model_mu is not None and model_sigma is not None:
+            # Assumes label indexes components directly
+            entry["model_mu"] = float(model_mu[label])
+            entry["model_sigma"] = float(model_sigma[label])
+
+        stats[int(label)] = entry
+
+    return stats
+
+
+def plot_1d_velocity_clustering(
+    df_features: pd.DataFrame,
+    img: Image.Image | np.ndarray | None,
+    *,
+    idata: Any,
+    cluster_pred: np.ndarray,
+    posterior_probs: np.ndarray,
+    scaler: Any | None = None,
+) -> tuple[Figure, np.ndarray, dict[int, dict[str, float]]]:
+    """Plot 1D velocity clustering results for marginalized model.
+
+    Args:
+        df_features: DataFrame with columns ``x``, ``y``, ``u``, ``v``, and ``V``.
+        img: Optional background image array.
+        idata: ArviZ ``InferenceData`` containing posterior draws for ``mu`` and ``sigma``.
+        cluster_pred: Array of hard cluster assignments per point.
+        posterior_probs: Array of responsibilities per point and cluster.
+        scaler: Optional scaler to inverse-transform model parameters for overlay.
+
+    Returns:
+        Tuple[Figure, np.ndarray, Dict[int, Dict[str, float]]]:
+            Matplotlib figure, uncertainty (entropy) per point, and the statistics
+            dictionary returned by ``compute_cluster_statistics``.
     """
 
-    # Compute uncertainty (entropy) for each point
-    uncertainty = -np.sum(posterior_probs * np.log(posterior_probs + 1e-12), axis=1)
-    max_probs = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
+    # Per-point uncertainty (entropy) for scatter plot and return value
+    entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-12), axis=1)
+    # Max probs can be useful for debugging/annotation; compute if needed
+    # max_probs = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
 
-    # Get model parameters
+    # Get model parameters for overlay (posterior means)
     mu_posterior = idata.posterior["mu"].mean(dim=["chain", "draw"]).values.flatten()
     sigma_posterior = (
         idata.posterior["sigma"].mean(dim=["chain", "draw"]).values.flatten()
@@ -316,12 +439,12 @@ def plot_1d_velocity_clustering(
     scatter = ax2.scatter(
         df_features["x"],
         df_features["y"],
-        c=uncertainty,
+        c=entropy,
         cmap="plasma",
         s=8,
         alpha=0.8,
         vmin=0,
-        vmax=uncertainty.max(),
+        vmax=entropy.max(),
     )
     ax2.set_aspect("equal")
     ax2.set_xticks([])
@@ -347,7 +470,9 @@ def plot_1d_velocity_clustering(
                 linewidth=0.5,
             )
     # Overlay model distributions
-    v_range = np.linspace(velocity.min(), velocity.max(), 200)
+    # Ensure numpy array for range computation
+    velocity_arr = np.asarray(velocity)
+    v_range = np.linspace(float(np.min(velocity_arr)), float(np.max(velocity_arr)), 200)
     for label in unique_labels:
         if scaler is not None:
             mu_orig = scaler.inverse_transform([[mu_posterior[label]]])[0, 0]
@@ -370,35 +495,33 @@ def plot_1d_velocity_clustering(
     ax3.grid(True, alpha=0.3)
     ax3.legend(fontsize=10, framealpha=0.9)
 
-    # Statistics box
+    # Render statistics box
+    stats = compute_cluster_statistics(
+        df_features,
+        cluster_pred,
+        posterior_probs,
+        idata=idata,
+        scaler=scaler,
+        feature_index=0,
+    )
     fig.subplots_adjust(right=0.98)
     stats_text = "CLUSTER STATISTICS\n" + "=" * 40 + "\n"
-    for label in unique_labels:
-        mask = cluster_pred == label
-        count = mask.sum()
-        if count == 0:
-            continue
-        v_mean = velocity[mask].mean()
-        v_std = velocity[mask].std()
-        v_median = np.median(velocity[mask])
-        nmad = np.median(np.abs(velocity[mask] - v_median)) * 1.4826
-        x_mean = df_features.loc[mask, "x"].mean()
-        y_mean = df_features.loc[mask, "y"].mean()
-        x_std = df_features.loc[mask, "x"].std()
-        y_std = df_features.loc[mask, "y"].std()
-        avg_uncertainty = uncertainty[mask].mean()
-        avg_prob = max_probs[mask].mean()
-        stats_text += f"CLUSTER {label} (pts: {count})\n"
-        stats_text += f"├─ Center: ({x_mean:.1f}, {y_mean:.1f})\n"
-        stats_text += f"├─ Spread: (σx={x_std:.1f}, σy={y_std:.1f})\n"
-        stats_text += f"├─ Velocity: {v_mean:.4f} ± {v_std:.4f}\n"
-        stats_text += f"├─ Median/NMAD: {v_median:.4f}/{nmad:.4f}\n"
+    for label in sorted(stats.keys()):
+        s = stats[label]
+        stats_text += f"CLUSTER {label} (pts: {s['count']})\n"
+        stats_text += f"├─ Center: ({s['x_mean']:.1f}, {s['y_mean']:.1f})\n"
+        stats_text += f"├─ Spread: (σx={s['x_std']:.1f}, σy={s['y_std']:.1f})\n"
         stats_text += (
-            f"├─ Model μ/σ: {mu_posterior[label]:.4f}/{sigma_posterior[label]:.4f}\n"
+            f"├─ Velocity: {s['velocity_mean']:.4f} ± {s['velocity_std']:.4f}\n"
         )
-        stats_text += f"├─ Avg Uncertainty: {avg_uncertainty:.4f}\n"
-        stats_text += f"└─ Avg Assignment Prob: {avg_prob:.4f}\n\n"
-    # Place statistics box in empty space
+        stats_text += (
+            f"├─ Median/NMAD: {s['velocity_median']:.4f}/{s['velocity_nmad']:.4f}\n"
+        )
+        if s["model_mu"] is not None and s["model_sigma"] is not None:
+            stats_text += f"├─ Model μ/σ: {s['model_mu']:.4f}/{s['model_sigma']:.4f}\n"
+        stats_text += f"├─ Avg Entropy: {s['avg_entropy']:.4f}\n"
+        stats_text += f"└─ Avg Assignment Prob: {s['avg_assignment_prob']:.4f}\n\n"
+
     fig.text(
         0.72,
         0.05,
@@ -409,5 +532,5 @@ def plot_1d_velocity_clustering(
         bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8),
     )
 
-    plt.tight_layout(rect=[0, 0, 0.7, 1])
-    return fig, uncertainty
+    plt.tight_layout(rect=(0, 0, 0.7, 1))
+    return fig, entropy, stats

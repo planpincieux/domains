@@ -110,7 +110,7 @@ for date in dates:
         )
 
         # Plot results
-        fig, uncertainty = plot_1d_velocity_clustering(
+        fig, uncertainty, stats = plot_1d_velocity_clustering(
             df_features,
             img,
             idata=idata,
