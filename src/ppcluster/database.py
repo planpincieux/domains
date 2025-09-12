@@ -6,9 +6,9 @@ import pandas as pd
 import requests
 from PIL import Image
 
-from src.config import ConfigManager
+from ppcluster.config import ConfigManager
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ppcx")
 
 config = ConfigManager()
 

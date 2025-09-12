@@ -9,17 +9,16 @@ from sklearn.mixture import BayesianGaussianMixture
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
-from src.clustering import (
-    plot_gmm_clusters,
-    preproc_features,
-)
 from src.config import ConfigManager
 from src.database import (
-    apply_dic_filters,
     get_dic_analysis_ids,
     get_dic_data,
     get_image,
 )
+from src.gmm import (
+    plot_gmm_clusters,
+)
+from src.preprocessing import apply_dic_filters, preproc_features
 from src.roi import PolygonROISelector, filter_dataframe
 from src.visualization import plot_dic_vectors
 

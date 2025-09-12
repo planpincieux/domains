@@ -12,7 +12,7 @@ from ppcx_pymc_func import (
     compute_posterior_assignments,
     plot_1d_velocity_clustering,
 )
-from src.clustering import preproc_features
+from src.gmm import preproc_features
 from src.config import ConfigManager
 from src.database import (
     get_dic_analysis_by_ids,

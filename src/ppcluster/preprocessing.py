@@ -4,8 +4,89 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 from scipy.spatial import cKDTree
+from sklearn.preprocessing import StandardScaler
 
-logger = logging.getLogger(__name__)
+RANDOM_SEED = 8927
+logger = logging.getLogger("ppcx")
+
+
+def preproc_features(df):
+    """
+    Create additional features for clustering glacier displacement data
+    """
+    df_features = df.copy()
+
+    # Direction angle (in radians and degrees)
+    df_features["angle_rad"] = np.arctan2(df["v"], df["u"])
+    df_features["angle_deg"] = np.degrees(df_features["angle_rad"])
+
+    # Convert negative angles to positive (0-360 degrees)
+    df_features["angle_deg"] = (df_features["angle_deg"] + 360) % 360
+
+    # Directional components (unit vectors)
+    df_features["u_unit"] = df["u"] / (df["V"] + 1e-10)  # Avoid division by zero
+    df_features["v_unit"] = df["v"] / (df["V"] + 1e-10)
+
+    # Square Magnitude of displacement
+    df_features["V_squared"] = df["V"] ** 2
+
+    # Log magnitude for better clustering of different scales
+    df_features["log_magnitude"] = np.log1p(df["V"])
+
+    # Magnitude categories
+    magnitude_percentiles = np.percentile(df["V"], [25, 50, 75])
+    df_features["magnitude_category"] = pd.cut(
+        df["V"],
+        bins=[0] + list(magnitude_percentiles) + [np.inf],
+        labels=["low", "medium", "high", "very_high"],
+    )
+
+    return df_features
+
+
+def normalize_data(
+    df,
+    spatial_weight=0.3,
+    velocity_weight=0.7,
+    spatial_features_names=None,
+    velocity_features_names=None,
+):
+    """
+    Custom clustering approach that considers both spatial proximity and velocity similarity
+
+    Parameters:
+    - spatial_weight: weight for spatial coordinates (x, y)
+    - velocity_weight: weight for velocity features (u, v, magnitude, direction)
+    """
+
+    if spatial_features_names is None:
+        spatial_features_names = ["x", "y"]
+    if velocity_features_names is None:
+        velocity_features_names = ["u", "v", "V", "angle_deg"]
+
+    # Prepare features for clustering
+    spatial_features = df[spatial_features_names].values
+    velocity_features = df[velocity_features_names].values
+
+    # Normalize features separately
+    spatial_scaler = StandardScaler()
+    velocity_scaler = StandardScaler()
+
+    spatial_normalized = spatial_scaler.fit_transform(spatial_features)
+    velocity_normalized = velocity_scaler.fit_transform(velocity_features)
+
+    # Create a DataFrame with normalized features
+    normalized_df = pd.DataFrame(
+        np.hstack(
+            [
+                spatial_normalized * spatial_weight,
+                velocity_normalized * velocity_weight,
+            ]
+        ),
+        columns=spatial_features_names + velocity_features_names,
+    )
+
+    return normalized_df, spatial_scaler, velocity_scaler
 
 
 def apply_dic_filters(

@@ -107,7 +107,7 @@ def compute_posterior_assignments(
     *,
     n_posterior_samples=None,
     use_posterior_mean=False,
-    random_seed=8927,
+    random_seed=RANDOM_SEED,
 ):
     """
     Compute assignment probabilities, hard labels and uncertainty for a marginalized model.

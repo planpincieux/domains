@@ -8,6 +8,7 @@ from matplotlib.axes import Axes
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from PIL import Image as PILImage
+from sklearn.preprocessing import StandardScaler
 
 
 def plot_dic_vectors(
@@ -227,39 +228,6 @@ def plot_dic_scatter(
     return fig, ax, scatter
 
 
-def save_or_show_plot(
-    fig: Figure,
-    output_dir: str | Path | None = None,
-    filename: str | None = None,
-    show: bool = False,
-    dpi: int = 300,
-    close_after_save: bool = True,
-) -> None:
-    """Save plot to file or show it interactively.
-
-    Args:
-        fig: Matplotlib figure to save/show
-        output_dir: Directory to save plots
-        filename: Filename (without extension)
-        show: If True, show the plot interactively
-        dpi: Dots per inch for saved figure
-        close_after_save: If True, close figure after saving
-    """
-    if output_dir and filename:
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        save_path = output_path / f"{filename}.png"
-        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        print(f"Plot saved to: {save_path}")
-        if close_after_save:
-            plt.close(fig)
-    elif show:
-        plt.show()
-    else:
-        if close_after_save:
-            plt.close(fig)
-
-
 def visualize_dic_dataframe(
     df: pd.DataFrame,
     plot_type: str = "quiver",
@@ -421,10 +389,93 @@ def visualize_dic_dataframe(
                 filename = f"dic_{plot_type}"
 
         # Save or show plot
-        save_or_show_plot(fig, output_dir, filename, show, dpi)
+        _save_or_show_plot(fig, output_dir, filename, show, dpi)
         return None
     else:
         return result
+
+
+def visualize_uv_plt(df, ax=None, **kwargs):
+    """
+    Visualize the u-v scatter plot with optional background image.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+    V = df["V"].values if "V" in df else np.sqrt(df["u"] ** 2 + df["v"] ** 2)
+    scatter = ax.scatter(
+        df["u"], df["v"], s=1, c=V, alpha=0.6, cmap="viridis", **kwargs
+    )
+    ax.set_xlabel("u (displacement in x direction)")
+    ax.set_ylabel("v (displacement in y direction)")
+    ax.set_title("Displacement Vectors (u-v Scatter Plot)")
+    plt.colorbar(scatter, ax=ax)
+    ax.set_aspect("equal", adjustable="box")
+
+
+def visualize_pca(df, columns_to_extract=None, normalize=False):
+    "visualize the enhanced features using PCA for dimensionality reduction"
+    from sklearn.decomposition import PCA
+
+    # Prepare data for PCA
+    if columns_to_extract is None:
+        columns_to_extract = ["x", "y", "u", "v", "V", "angle_deg"]
+
+    # Ensure all required columns are present in the DataFrame
+    missing_columns = set(columns_to_extract) - set(df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing columns in DataFrame: {missing_columns}")
+
+    if normalize:
+        scaler = StandardScaler()
+        data = scaler.fit_transform(df[columns_to_extract])
+    else:
+        data = df[columns_to_extract].values
+
+    # Reduce to 2D using PCA
+    pca = PCA(n_components=2)
+    reduced_data = pca.fit_transform(data)
+    df_reduced = pd.DataFrame(reduced_data, columns=["PC1", "PC2"])
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(df_reduced["PC1"], df_reduced["PC2"], s=1, alpha=0.6)
+    ax.set_xlabel("Principal Component 1")
+    ax.set_ylabel("Principal Component 2")
+    ax.set_title("PCA Reduced Features Scatter Plot")
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _save_or_show_plot(
+    fig: Figure,
+    output_dir: str | Path | None = None,
+    filename: str | None = None,
+    show: bool = False,
+    dpi: int = 300,
+    close_after_save: bool = True,
+) -> None:
+    """Save plot to file or show it interactively.
+
+    Args:
+        fig: Matplotlib figure to save/show
+        output_dir: Directory to save plots
+        filename: Filename (without extension)
+        show: If True, show the plot interactively
+        dpi: Dots per inch for saved figure
+        close_after_save: If True, close figure after saving
+    """
+    if output_dir and filename:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        save_path = output_path / f"{filename}.png"
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        print(f"Plot saved to: {save_path}")
+        if close_after_save:
+            plt.close(fig)
+    elif show:
+        plt.show()
+    else:
+        if close_after_save:
+            plt.close(fig)
 
 
 # Convenience functions for specific use cases

@@ -1,9 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "ppcx-domain"
+name = "ppcluster"
 version = "0.1.0"
 description = "Add your description here"
+authors = [{ name = "Francesco Ioli", email = "francescoioli@cnr.it" }]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "cmcrameri>=1.9",
     "dotenv>=0.9.9",
@@ -29,3 +34,25 @@ dependencies = [
     "sqlalchemy>=2.0.41",
     "tqdm>=4.66.1",
 ]
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ppcluster"]
+
+[tool.hatch.version]
+path = "src/ppcluster/__init__.py"
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+
+[tool.bumpver]
+current_version = "0.1.0"
+version_pattern = "MAJOR.MINOR.PATCH"
+commit_message = "bump version {old_version} -> {new_version}"
+commit = true
+tag = false
+push = false
+
+[tool.bumpver.file_patterns]
+"pyproject.toml" = ['current_version = "{version}"', 'version = "{version}"']
+"src/ppcluster/__init__.py" = ["{version}"]
