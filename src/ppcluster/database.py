@@ -171,12 +171,15 @@ def get_dic_analysis_ids(
 
     query += " ORDER BY DIC.master_timestamp"
 
-    df = pd.read_sql(query, db_engine, params=tuple(params))
+    # Read only the dic_id column for efficiency
+    df = pd.read_sql(query, db_engine, params=tuple(params), columns=["dic_id"])
     if df.empty:
         logger.warning("No DIC analyses found for the given criteria")
         return []
     logger.info(f"Found {len(df)} DIC analyses matching criteria")
-    return df["dic_id"].tolist()
+
+    # Always return a list of ints
+    return df["dic_id"].astype(int).tolist()
 
 
 def get_dic_analysis_by_ids(
