@@ -97,6 +97,8 @@ def apply_dic_filters(
     apply_2d_median: bool | None = False,
     median_window_size: int | None = 5,
     median_threshold_factor: float | None = 3.0,
+    apply_2d_gaussian: bool | None = False,
+    gaussian_sigma: float | None = 1.0,
 ) -> pd.DataFrame:
     """
     Apply all DIC data filters in sequence.
@@ -134,6 +136,11 @@ def apply_dic_filters(
             window_size=median_window_size,
             threshold_factor=median_threshold_factor,
         )
+
+    # 4. Apply 2D Gaussian smoothing to velocity magnitude
+    if apply_2d_gaussian:
+        df_filtered = apply_2d_gaussian_filter(df_filtered, sigma=gaussian_sigma)
+
     logger.info(
         f"DIC filtering pipeline completed: {len(df)} -> {len(df_filtered)} points "
         f"(removed {len(df) - len(df_filtered)} total)"
@@ -200,7 +207,7 @@ def filter_by_min_velocity(
     return df_filtered
 
 
-def create_2d_grid(df: pd.DataFrame, grid_spacing: float = None) -> tuple:
+def create_2d_grid(df: pd.DataFrame, grid_spacing: float | None = None) -> tuple:
     """
     Create a 2D grid from scattered DIC points.
 
@@ -259,69 +266,164 @@ def apply_2d_median_filter(
     df: pd.DataFrame,
     window_size: int | None = 5,
     threshold_factor: float | None = 3.0,
-    velocity_column: str = "V",
 ) -> pd.DataFrame:
     """
     Apply 2D median filter to remove outliers based on local neighborhood.
-
-    Args:
-        df: DataFrame with DIC data containing 'x', 'y', 'u', 'v', 'V' columns
-        window_size: Size of the median filter window (odd number recommended)
-        threshold_factor: Factor for outlier detection (n * median_deviation)
-        velocity_column: Column name for velocity magnitude
-
-    Returns:
-        Filtered DataFrame
+    Now evaluates u, v and V components. A point is removed if any component
+    is an outlier relative to its local median +/- threshold_factor * MAD.
     """
     logger.info(
-        f"Applying 2D median filter: window_size={window_size}, threshold_factor={threshold_factor}"
+        f"Applying 2D median filter (u,v,V): window_size={window_size}, threshold_factor={threshold_factor}"
     )
 
     # Create 2D grid from scattered points
     X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid(df)
 
-    # Apply median filter only to valid points
-    v_mag_filtered = np.full_like(v_mag_grid, np.nan)
+    # Prepare work arrays with NaNs where invalid
+    u_work = u_grid.copy().astype(float)
+    v_work = v_grid.copy().astype(float)
+    V_work = v_mag_grid.copy().astype(float)
 
-    # Create a copy for filtering
-    v_mag_work = v_mag_grid.copy()
-    v_mag_work[~valid_mask] = np.nan
+    u_work[~valid_mask] = np.nan
+    v_work[~valid_mask] = np.nan
+    V_work[~valid_mask] = np.nan
 
-    # Apply median filter
-    v_mag_median = ndimage.median_filter(v_mag_work, size=window_size)
+    size = int(window_size) if window_size is not None else 5
 
-    # Calculate local median absolute deviation (MAD)
-    # MAD = median(|x_i - median(x)|)
-    mad_grid = np.abs(v_mag_work - v_mag_median)
-    mad_median = ndimage.median_filter(mad_grid, size=window_size)
+    # Helper to compute nanmedian with generic_filter
+    nanmedian = lambda arr: float(np.nanmedian(arr))
 
-    # Create outlier mask
-    outlier_threshold = threshold_factor * mad_median
-    outlier_mask = np.abs(v_mag_work - v_mag_median) > outlier_threshold
+    u_median = ndimage.generic_filter(
+        u_work, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    v_median = ndimage.generic_filter(
+        v_work, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    V_median = ndimage.generic_filter(
+        V_work, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
 
-    # Count outliers
-    n_outliers = np.sum(outlier_mask & valid_mask)
-    logger.info(f"Detected {n_outliers} outliers in 2D median filter")
+    # compute local MAD (median of absolute deviations)
+    u_abs_dev = np.abs(u_work - u_median)
+    v_abs_dev = np.abs(v_work - v_median)
+    V_abs_dev = np.abs(V_work - V_median)
 
-    # Create list of valid point indices to keep
+    u_mad = ndimage.generic_filter(
+        u_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    v_mad = ndimage.generic_filter(
+        v_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    V_mad = ndimage.generic_filter(
+        V_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+
+    # thresholding (avoid zero MAD by adding tiny eps)
+    eps = 1e-12
+    outlier_u = (
+        np.abs(u_work - u_median) > (threshold_factor * (u_mad + eps))
+    ) & valid_mask
+    outlier_v = (
+        np.abs(v_work - v_median) > (threshold_factor * (v_mad + eps))
+    ) & valid_mask
+    outlier_V = (
+        np.abs(V_work - V_median) > (threshold_factor * (V_mad + eps))
+    ) & valid_mask
+
+    # combined outlier: any component flagged
+    outlier_mask = outlier_u | outlier_v | outlier_V
+
+    n_outliers = int(np.sum(outlier_mask))
+    logger.info(f"Detected {n_outliers} outliers (u/v/V combined) in 2D median filter")
+
+    # Build list of valid indices to keep (not an outlier)
     keep_indices = []
     for idx, row in df.iterrows():
-        # Find grid position
         i = np.argmin(np.abs(Y[:, 0] - row["y"]))
         j = np.argmin(np.abs(X[0, :] - row["x"]))
-
-        # Check if this point should be kept
         if not outlier_mask[i, j]:
             keep_indices.append(idx)
 
-    # Filter DataFrame
     df_filtered = df.iloc[keep_indices].reset_index(drop=True)
     logger.info(
-        f"2D median filtering: {len(df)} -> {len(df_filtered)} points "
-        f"(removed {len(df) - len(df_filtered)} outliers)"
+        f"2D median filtering (u,v,V): {len(df)} -> {len(df_filtered)} points (removed {len(df) - len(df_filtered)})"
     )
-
     return df_filtered
+
+
+def apply_2d_gaussian_filter(
+    df: pd.DataFrame, sigma: float | None = 1.0
+) -> pd.DataFrame:
+    """
+    Smooth u, v and velocity magnitude with a 2D Gaussian filter.
+
+    - Uses mask-normalized gaussian filtering to respect missing cells.
+    - Adds columns 'u_gauss', 'v_gauss', 'V_gauss' to returned DataFrame.
+    """
+    sigma = sigma or 1.0
+    logger.info(f"Applying 2D Gaussian filter (u,v,V): sigma={sigma}")
+
+    # Build grid from points
+    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid(df)
+
+    if not np.any(valid_mask):
+        logger.warning(
+            "apply_2d_gaussian_filter: no valid grid cells found, returning original df"
+        )
+        df_out = df.copy()
+        df_out["u_gauss"] = df_out["u"]
+        df_out["v_gauss"] = df_out["v"]
+        df_out["V_gauss"] = df_out["V"]
+        return df_out
+
+    # Prepare arrays for convolution: replace NaN with 0 and use validity mask
+    u_work = np.where(valid_mask, u_grid, 0.0)
+    v_work = np.where(valid_mask, v_grid, 0.0)
+    V_work = np.where(valid_mask, v_mag_grid, 0.0)
+    mask_work = valid_mask.astype(float)
+
+    # Smooth numerator and denominator for each component
+    num_u = ndimage.gaussian_filter(u_work, sigma=sigma, mode="constant", cval=0.0)
+    num_v = ndimage.gaussian_filter(v_work, sigma=sigma, mode="constant", cval=0.0)
+    num_V = ndimage.gaussian_filter(V_work, sigma=sigma, mode="constant", cval=0.0)
+    den = ndimage.gaussian_filter(mask_work, sigma=sigma, mode="constant", cval=0.0)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        u_smoothed = num_u / den
+        v_smoothed = num_v / den
+        V_smoothed = num_V / den
+
+    u_smoothed[den == 0] = np.nan
+    v_smoothed[den == 0] = np.nan
+    V_smoothed[den == 0] = np.nan
+
+    # Map smoothed grid back to points
+    df_out = df.copy()
+    sm_u = []
+    sm_v = []
+    sm_V = []
+    x_grid = X[0, :]
+    y_grid = Y[:, 0]
+    for _, row in df_out.iterrows():
+        i = np.argmin(np.abs(y_grid - row["y"]))
+        j = np.argmin(np.abs(x_grid - row["x"]))
+        sm_u.append(u_smoothed[i, j])
+        sm_v.append(v_smoothed[i, j])
+        sm_V.append(V_smoothed[i, j])
+
+    df_out["u_gauss"] = sm_u
+    df_out["v_gauss"] = sm_v
+    df_out["V_gauss"] = sm_V
+
+    n_none = int(
+        np.isnan(df_out["V_gauss"]).sum()
+        + np.isnan(df_out["u_gauss"]).sum()
+        + np.isnan(df_out["v_gauss"]).sum()
+    )
+    logger.info(
+        f"apply_2d_gaussian_filter: smoothed values assigned, NaN mapped points (total components)={n_none}"
+    )
+    return df_out
 
 
 # === SPATIAL SUBSAMPLING ===

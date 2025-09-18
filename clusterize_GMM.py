@@ -9,18 +9,18 @@ from sklearn.mixture import BayesianGaussianMixture
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
-from src.config import ConfigManager
-from src.database import (
+from ppcluster.config import ConfigManager
+from ppcluster.database import (
     get_dic_analysis_ids,
     get_dic_data,
     get_image,
 )
-from src.gmm import (
+from ppcluster.gmm import (
     plot_gmm_clusters,
 )
-from src.preprocessing import apply_dic_filters, preproc_features
-from src.roi import PolygonROISelector, filter_dataframe
-from src.visualization import plot_dic_vectors
+from ppcluster.preprocessing import apply_dic_filters, preproc_features
+from ppcluster.roi import PolygonROISelector, filter_dataframe
+from ppcluster.visualization import plot_dic_vectors
 
 # use agg backend for matplotlib to avoid display issues
 plt.switch_backend("agg")

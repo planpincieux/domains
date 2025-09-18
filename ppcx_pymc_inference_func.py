@@ -119,21 +119,21 @@ def plot_cluster_labels_on_image(
         ax.imshow(img, alpha=0.3, cmap="gray")
 
     unique_labels = np.unique(cluster_pred)
-    palette = [
-        "#E31A1C",
-        "#1F78B4",
-        "#33A02C",
-        "#FF7F00",
-        "#6A3D9A",
-        "#B15928",
-        "#A6CEE3",
-        "#B2DF8A",
-        "#FB9A99",
-        "#FDBF6F",
-    ]
+    # reserve a color for noise / NaN mapped to -1
+    noise_label = -1
+    labels_no_noise = [lab for lab in sorted(unique_labels) if lab != noise_label]
+
+    # build a discrete colormap sized to the number of non-noise labels
+    n = max(1, len(labels_no_noise))
+    cmap = plt.cm.get_cmap("tab20", n)
+    colors_arr = [cmap(i) for i in range(n)]
+
     color_map = {}
-    for i, lab in enumerate(sorted(unique_labels)):
-        color_map[lab] = "#7f7f7f" if lab == -1 else palette[i % len(palette)]
+    for i, lab in enumerate(labels_no_noise):
+        color_map[lab] = colors_arr[i]
+    # assign noise color
+    if noise_label in unique_labels:
+        color_map[noise_label] = "#7f7f7f"
 
     for label in sorted(unique_labels):
         mask = cluster_pred == label
@@ -141,7 +141,7 @@ def plot_cluster_labels_on_image(
             ax.scatter(
                 df_features.loc[mask, "x"],
                 df_features.loc[mask, "y"],
-                c=color_map[label],
+                c=[color_map[label]],
                 s=markersize,
                 alpha=0.8,
                 label=f"Cluster {label}",
@@ -446,23 +446,17 @@ def plot_1d_velocity_clustering_simple(
     # Max probs can be useful for debugging/annotation; compute if needed
     # max_probs = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
 
-    # Distinct colors
     unique_labels = np.unique(cluster_pred)
-    colors = [
-        "#E31A1C",
-        "#1F78B4",
-        "#33A02C",
-        "#FF7F00",
-        "#6A3D9A",
-        "#B15928",
-        "#A6CEE3",
-        "#B2DF8A",
-        "#FB9A99",
-        "#FDBF6F",
-        "#CAB2D6",
-        "#FFFF99",
-    ][: len(unique_labels)]
-    color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
+    noise_label = -1
+    labels_no_noise = [lab for lab in sorted(unique_labels) if lab != noise_label]
+    n = max(1, len(labels_no_noise))
+    cmap = plt.cm.get_cmap("tab20", n)
+    colors_arr = [cmap(i) for i in range(n)]
+    color_map = {}
+    for i, lab in enumerate(labels_no_noise):
+        color_map[lab] = colors_arr[i]
+    if noise_label in unique_labels:
+        color_map[noise_label] = "#7f7f7f"
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
@@ -508,7 +502,7 @@ def plot_1d_velocity_clustering_simple(
             ax1.scatter(
                 df_features.loc[mask, "x"],
                 df_features.loc[mask, "y"],
-                c=color_map[label],
+                c=[color_map[label]],
                 s=8,
                 alpha=0.8,
                 label=f"Cluster {label}",

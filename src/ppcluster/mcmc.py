@@ -53,7 +53,7 @@ def assign_spatial_priors(
 
 def plot_spatial_priors(
     df: pd.DataFrame,
-    prior_probs: np.ndarray,
+    prior_probs: np.ndarray | Image.Image,
     img: np.ndarray | None = None,
     cmap: str = "Reds",
     point_size: float = 1,
