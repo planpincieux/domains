@@ -16,7 +16,64 @@ RANDOM_SEED = 8927
 rng = np.random.default_rng(RANDOM_SEED)
 
 
+""" PRIOR """
+
+
 def assign_spatial_priors(
+    df: pd.DataFrame,
+    polygons: dict[str, Any],
+    prior_probs: dict[str, list[float]],
+) -> np.ndarray:
+    """
+    Assign spatial prior probabilities to each point based on sector polygons and a prior probability dictionary.
+
+    - polygons: dict mapping sector name -> Polygon object (must have .contains_points(x, y))
+    - prior_probs: dict mapping sector name -> probability vector (list of floats, length = n_sectors)
+    - Points not inside any sector get uniform probability.
+
+    Returns:
+        prior_probs_arr: (ndata, n_sectors) array
+    """
+    sector_names = list(polygons.keys())
+    n_sectors = len(sector_names)
+    ndata = len(df)
+
+    # Validate prior_probs dictionary
+    if set(prior_probs.keys()) != set(sector_names):
+        raise ValueError(
+            f"assign_spatial_priors: sector names in polygons and prior_probs do not match.\n"
+            f"polygons: {sector_names}\nprior_probs: {list(prior_probs.keys())}"
+        )
+    for name, vec in prior_probs.items():
+        arr = np.asarray(vec, dtype=float)
+        if arr.ndim != 1 or arr.size != n_sectors:
+            raise ValueError(
+                f"assign_spatial_priors: prior vector for '{name}' must be 1D and length {n_sectors}."
+            )
+        if np.any(arr < 0) or arr.sum() <= 0:
+            raise ValueError(
+                f"assign_spatial_priors: probabilities for '{name}' must be non-negative and sum > 0."
+            )
+
+    # Default uniform prior
+    uniform = np.ones(n_sectors, dtype=float) / n_sectors
+    prior_probs_arr = np.tile(uniform, (ndata, 1))
+
+    # Extract x,y coordinates of the points
+    x = df["x"].values
+    y = df["y"].values
+
+    # For each sector, assign its prior to points inside
+    for name, polygon in polygons.items():
+        mask = polygon.contains_points(x, y)
+        prior_probs_arr[mask, :] = np.asarray(prior_probs[name], dtype=float) / np.sum(
+            prior_probs[name]
+        )
+
+    return prior_probs_arr
+
+
+def assign_spatial_priors_legacy(
     df: pd.DataFrame,
     sectors: Sequence[Any],
     prior_strength: float = 0.8,
@@ -116,6 +173,9 @@ def plot_spatial_priors(
     plt.tight_layout()
     plt.show()
     return fig, axes
+
+
+""" POSTERIOR AND STATISTICS """
 
 
 def compute_posterior_assignments(
