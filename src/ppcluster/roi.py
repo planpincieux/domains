@@ -1,9 +1,12 @@
+import logging
 from pathlib import Path
 
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.path import Path as MplPath
 from matplotlib.widgets import PolygonSelector
+
+logger = logging.getLogger("ppcx")
 
 
 class PolygonROISelector:
@@ -79,7 +82,7 @@ class PolygonROISelector:
         self.polygon_points = list(verts)
         if len(self.polygon_points) >= 3:
             self.polygon_path = MplPath(self.polygon_points)
-        print(f"Polygon updated: {len(self.polygon_points)} vertices")
+        logger.info(f"Polygon updated: {len(self.polygon_points)} vertices")
 
     def _on_key_press(self, event):
         """Handle key press events for the interactive selector."""
@@ -88,30 +91,32 @@ class PolygonROISelector:
 
         if event.key == "enter":
             if len(self.polygon_points) >= 3:
-                print("Polygon selection completed!")
+                logger.info("Polygon selection completed!")
                 if self.file_path:
                     self.to_file(self.file_path)
-                    print(f"Polygon points saved to {self.file_path}")
+                    logger.info(f"Polygon points saved to {self.file_path}")
                 # Close the figure to end interaction
                 with contextlib.suppress(Exception):
                     plt.close(self.fig)
             else:
-                print("Need at least 3 points to form a polygon")
+                logger.info("Need at least 3 points to form a polygon")
         elif event.key == "escape":
-            print("Polygon selection cancelled")
+            logger.info("Polygon selection cancelled")
             with contextlib.suppress(Exception):
                 plt.close(self.fig)
 
     def filter_dataframe(self, df, x_col="x", y_col="y"):
         """Filter the dataframe to keep only points inside the polygon."""
         if self.polygon_path is None:
-            print("No polygon defined, returning original dataframe")
+            logger.info("No polygon defined, returning original dataframe")
             return df
         if x_col not in df.columns or y_col not in df.columns:
             raise ValueError(f"DataFrame must contain columns '{x_col}' and '{y_col}'")
         mask = self.create_mask(df=df, x_col=x_col, y_col=y_col)
         filtered_df = df[mask].reset_index(drop=True)
-        print(f"Filtered {len(df)} points to {len(filtered_df)} points inside polygon")
+        logger.info(
+            f"Filtered {len(df)} points to {len(filtered_df)} points inside polygon"
+        )
         return filtered_df
 
     def visualize(self, df, img=None, figsize=(12, 5)):
@@ -140,7 +145,7 @@ class PolygonROISelector:
         import json
 
         if not self.polygon_points:
-            print("No polygon points selected to save")
+            logger.info("No polygon points selected to save")
             return
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,7 +155,7 @@ class PolygonROISelector:
         with open(path, "w") as f:
             json.dump(data, f)
         self.file_path = str(path)
-        print(f"Polygon selector saved to {path}")
+        logger.info(f"Polygon selector saved to {path}")
 
     def load_from_file(self, path):
         """Load polygon points from a JSON file and set them on this selector."""
@@ -212,13 +217,15 @@ def points_inside_polygon(polygon_path, points) -> np.ndarray:
 def filter_dataframe(df, polygon_path, x_col="x", y_col="y"):
     """Filter dataframe to keep only points inside the polygon."""
     if polygon_path is None:
-        print("No polygon defined, returning original dataframe")
+        logger.info("No polygon defined, returning original dataframe")
         return df
     if x_col not in df.columns or y_col not in df.columns:
         raise ValueError(f"DataFrame must contain columns '{x_col}' and '{y_col}'")
     mask = points_inside_polygon(polygon_path, df[[x_col, y_col]].values)
     filtered_df = df[mask].reset_index(drop=True)
-    print(f"Filtered {len(df)} points to {len(filtered_df)} points inside polygon")
+    logger.info(
+        f"Filtered {len(df)} points to {len(filtered_df)} points inside polygon"
+    )
     return filtered_df
 
 

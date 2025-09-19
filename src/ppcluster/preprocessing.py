@@ -358,7 +358,7 @@ def apply_2d_gaussian_filter(
     Smooth u, v and velocity magnitude with a 2D Gaussian filter.
 
     - Uses mask-normalized gaussian filtering to respect missing cells.
-    - Adds columns 'u_gauss', 'v_gauss', 'V_gauss' to returned DataFrame.
+    - Maps smoothed grid values back to original points.
     """
     sigma = sigma or 1.0
     logger.info(f"Applying 2D Gaussian filter (u,v,V): sigma={sigma}")
@@ -370,11 +370,7 @@ def apply_2d_gaussian_filter(
         logger.warning(
             "apply_2d_gaussian_filter: no valid grid cells found, returning original df"
         )
-        df_out = df.copy()
-        df_out["u_gauss"] = df_out["u"]
-        df_out["v_gauss"] = df_out["v"]
-        df_out["V_gauss"] = df_out["V"]
-        return df_out
+        return df
 
     # Prepare arrays for convolution: replace NaN with 0 and use validity mask
     u_work = np.where(valid_mask, u_grid, 0.0)
@@ -411,14 +407,14 @@ def apply_2d_gaussian_filter(
         sm_v.append(v_smoothed[i, j])
         sm_V.append(V_smoothed[i, j])
 
-    df_out["u_gauss"] = sm_u
-    df_out["v_gauss"] = sm_v
-    df_out["V_gauss"] = sm_V
+    df_out["u"] = sm_u
+    df_out["v"] = sm_v
+    df_out["V"] = sm_V
 
     n_none = int(
-        np.isnan(df_out["V_gauss"]).sum()
-        + np.isnan(df_out["u_gauss"]).sum()
-        + np.isnan(df_out["v_gauss"]).sum()
+        np.isnan(df_out["V"]).sum()
+        + np.isnan(df_out["u"]).sum()
+        + np.isnan(df_out["v"]).sum()
     )
     logger.info(
         f"apply_2d_gaussian_filter: smoothed values assigned, NaN mapped points (total components)={n_none}"
