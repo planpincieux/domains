@@ -271,7 +271,7 @@ def get_dic_data(
 def get_multi_dic_data(
     dic_ids: list[int],
     *,
-    stack_results: bool = True,
+    stack_results: bool = False,
     app_host: str | None = None,
     app_port: str | None = None,
     config: ConfigManager | None = None,

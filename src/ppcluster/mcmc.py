@@ -1,14 +1,20 @@
+import json
 import logging
 from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+import arviz as az
 import numpy as np
 import pandas as pd
+import pymc as pm
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from PIL import Image
+from scipy.spatial.distance import cdist
 from scipy.stats import norm as scipy_norm
 
 logger = logging.getLogger("ppcx")
@@ -16,34 +22,59 @@ RANDOM_SEED = 8927
 rng = np.random.default_rng(RANDOM_SEED)
 
 
+""" MCMC"""
+
+
+def sample_model(
+    model: pm.Model,
+    output_dir: Path | None = None,
+    base_name: str | None = None,
+    sigma: float | int | None = None,
+    **kwargs,
+) -> tuple[az.InferenceData, bool]:
+    """
+    Simple wrapper to sample a PyMC model with given kwargs and check convergence.
+    Returns an ArviZ InferenceData object and a convergence flag.
+    """
+
+    with model:
+        logger.info("Starting MCMC sampling...")
+        idata = pm.sample(**kwargs)
+        logger.info("Sampling completed.")
+
+    idata_summary = az.summary(idata, var_names=["mu", "sigma"])
+
+    if np.any(idata_summary["r_hat"] > 1.1) or np.any(idata_summary["ess_bulk"] < 200):
+        convergence_flag = False
+        logger.warning("MCMC chains did not fully converge by r_hat/ess criteria.")
+    else:
+        convergence_flag = True
+
+    if output_dir is not None and base_name is not None:
+        scale_str = f"_scale{sigma}" if sigma is not None else ""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        az.to_netcdf(idata, output_dir / f"{base_name}_posterior{scale_str}.idata.nc")
+        idata_summary.to_csv(
+            output_dir / f"{base_name}_posterior{scale_str}_summary.csv"
+        )
+
+    return idata, convergence_flag
+
+
 """ PRIOR """
 
 
-def assign_spatial_priors(
-    df: pd.DataFrame,
-    polygons: dict[str, Any],
-    prior_probs: dict[str, list[float]],
-) -> np.ndarray:
-    """
-    Assign spatial prior probabilities to each point based on sector polygons and a prior probability dictionary.
-
-    - polygons: dict mapping sector name -> Polygon object (must have .contains_points(x, y))
-    - prior_probs: dict mapping sector name -> probability vector (list of floats, length = n_sectors)
-    - Points not inside any sector get uniform probability.
-
-    Returns:
-        prior_probs_arr: (ndata, n_sectors) array
-    """
-    sector_names = list(polygons.keys())
+def _validate_and_normalize_prior_vecs(
+    prior_probs: dict[str, list[float]], sector_names: list[str]
+) -> dict[str, np.ndarray]:
+    """Validate prior_probs dict and return normalized numpy arrays per sector."""
     n_sectors = len(sector_names)
-    ndata = len(df)
-
-    # Validate prior_probs dictionary
     if set(prior_probs.keys()) != set(sector_names):
         raise ValueError(
-            f"assign_spatial_priors: sector names in polygons and prior_probs do not match.\n"
+            "assign_spatial_priors: sector names in polygons and prior_probs do not match.\n"
             f"polygons: {sector_names}\nprior_probs: {list(prior_probs.keys())}"
         )
+    prior_vecs: dict[str, np.ndarray] = {}
     for name, vec in prior_probs.items():
         arr = np.asarray(vec, dtype=float)
         if arr.ndim != 1 or arr.size != n_sectors:
@@ -54,21 +85,149 @@ def assign_spatial_priors(
             raise ValueError(
                 f"assign_spatial_priors: probabilities for '{name}' must be non-negative and sum > 0."
             )
+        prior_vecs[name] = arr / arr.sum()
+    return prior_vecs
 
-    # Default uniform prior
+
+def _polygon_contains_mask(
+    poly: Any, pts: np.ndarray, x: np.ndarray, y: np.ndarray
+) -> np.ndarray:
+    """Return boolean mask of points inside polygon (try common APIs)."""
+    try:
+        # common matplotlib Path-like API: contains_points(pts)
+        return np.asarray(poly.contains_points(pts), dtype=bool)
+    except Exception:
+        try:
+            # some objects accept separate x,y arrays
+            return np.asarray(poly.contains_points(x, y), dtype=bool)
+        except Exception:
+            # fallback: can't test membership -> no points inside
+            return np.zeros(len(x), dtype=bool)
+
+
+def _compute_sector_centroids(polygons: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Compute centroid for each polygon sector."""
+    centroids = {}
+    for name, poly in polygons.items():
+        if hasattr(poly, "path") and hasattr(poly.path, "vertices"):
+            vertices = np.asarray(poly.path.vertices)
+        else:
+            # Fallback for other polygon types
+            vertices = np.asarray(poly)
+        centroids[name] = vertices.mean(axis=0)
+    return centroids
+
+
+def _apply_distance_fade_per_cluster(
+    prior_weights: np.ndarray,
+    points: np.ndarray,
+    sector_mask: np.ndarray,
+    centroid: np.ndarray,
+    sector_prior_vec: np.ndarray,  # The base probabilities for this sector
+    method: str = "idw",
+    method_kws: dict | None = None,
+) -> np.ndarray:
+    """Apply distance-based fading to all cluster probabilities within a sector."""
+    if method_kws is None:
+        method_kws = {}
+
+    if not np.any(sector_mask):
+        return prior_weights
+
+    # Only compute distances for points INSIDE the sector
+    sector_points = points[sector_mask]
+    distances = cdist(sector_points, centroid.reshape(1, -1)).ravel()
+
+    if method == "idw":
+        power = method_kws.get("power", 2.0)
+        eps = method_kws.get("eps", 1e-6)
+        weights = 1.0 / (distances + eps) ** power
+
+    elif method == "linear":
+        max_dist = distances.max() if len(distances) > 0 else 1.0
+        weights = 1.0 - (distances / max_dist)
+
+    elif method == "exponential":
+        decay_rate = method_kws.get("decay_rate", 1.0)
+        weights = np.exp(-decay_rate * distances)
+
+    else:
+        raise ValueError(f"Unknown fading method: {method}")
+
+    # Normalize weights to [0, 1]
+    if weights.max() > 0:
+        weights = weights / weights.max()
+
+    # Apply fading to ALL cluster probabilities within this sector
+    faded_weights = prior_weights.copy()
+
+    # For points in this sector, interpolate between uniform and sector-specific probabilities
+    uniform = np.ones(len(sector_prior_vec)) / len(sector_prior_vec)
+
+    for i, point_weight in enumerate(weights):
+        point_idx = np.where(sector_mask)[0][i]  # Get original point index
+        # Interpolate: weight=1 -> sector_prior_vec, weight=0 -> uniform
+        faded_weights[point_idx, :] = (
+            point_weight * sector_prior_vec + (1 - point_weight) * uniform
+        )
+
+    return faded_weights
+
+
+def assign_spatial_priors(
+    x: np.ndarray,
+    y: np.ndarray,
+    polygons: dict[str, Any],
+    prior_probs: dict[str, list[float]],
+    *,
+    method: str = "constant",
+    method_kws: dict | None = None,
+) -> np.ndarray:
+    """Assign spatial prior probabilities to each point."""
+    if len(x) != len(y):
+        raise ValueError("x and y must have the same length.")
+
+    pts = np.column_stack((x, y))
+    sector_names = list(polygons.keys())
+    n_sectors = len(sector_names)
+    ndata = len(x)
+
+    prior_vecs = _validate_and_normalize_prior_vecs(prior_probs, sector_names)
+
+    # Initialize with uniform probabilities
     uniform = np.ones(n_sectors, dtype=float) / n_sectors
     prior_probs_arr = np.tile(uniform, (ndata, 1))
 
-    # Extract x,y coordinates of the points
-    x = df["x"].values
-    y = df["y"].values
+    if method == "constant":
+        # Original binary assignment
+        for name, polygon in polygons.items():
+            mask = _polygon_contains_mask(polygon, pts, x, y)
+            prior_probs_arr[mask, :] = prior_vecs[name]
 
-    # For each sector, assign its prior to points inside
-    for name, polygon in polygons.items():
-        mask = polygon.contains_points(x, y)
-        prior_probs_arr[mask, :] = np.asarray(prior_probs[name], dtype=float) / np.sum(
-            prior_probs[name]
-        )
+    else:
+        # Distance-based fading methods
+        centroids = _compute_sector_centroids(polygons)
+
+        # Apply fading for each sector independently
+        for name, polygon in polygons.items():
+            mask = _polygon_contains_mask(polygon, pts, x, y)
+            if np.any(mask):
+                centroid = centroids[name]
+                sector_prior_vec = prior_vecs[name]
+                prior_probs_arr = _apply_distance_fade_per_cluster(
+                    prior_probs_arr,
+                    pts,
+                    mask,
+                    centroid,
+                    sector_prior_vec,
+                    method=method,
+                    method_kws=method_kws,
+                )
+
+    # Ensure rows sum to 1
+    row_sums = prior_probs_arr.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums > 0, row_sums, 1.0)
+    prior_probs_arr = prior_probs_arr / row_sums
 
     return prior_probs_arr
 
@@ -92,6 +251,10 @@ def assign_spatial_priors_legacy(
         np.ndarray: Array of shape ``(n_points, k)`` with prior probabilities per observation
         and cluster.
     """
+    logger.warning(
+        "assign_spatial_priors_legacy is deprecated and will be removed in future versions. "
+        "Use update_spatial_prior instead."
+    )
     ndata = len(df)
     k = len(sectors)
     prior_probs = np.ones((ndata, k)) / k  # default uniform
@@ -180,8 +343,6 @@ def plot_spatial_priors(
 
 def compute_posterior_assignments(
     idata: Any,
-    X_scaled: np.ndarray,
-    prior_probs: np.ndarray,
     *,
     n_posterior_samples: int | None = None,
     use_posterior_mean: bool = False,
@@ -206,6 +367,19 @@ def compute_posterior_assignments(
             - cluster_pred: ``(n_points,)`` hard labels (argmax over clusters).
             - uncertainty: ``(n_points,)`` entropy of responsibilities per point.
     """
+    # Extract observed data used for inference
+    if "obs_data" not in idata.constant_data:
+        raise ValueError(
+            "compute_posterior_assignments: idata.constant_data must contain 'obs_data'."
+        )
+    obs_data = idata.constant_data["obs_data"].to_numpy()
+
+    # Extract prior probabilities
+    if "prior_w" not in idata.constant_data:
+        raise ValueError(
+            "compute_posterior_assignments: idata.constant_data must contain 'prior_w'."
+        )
+    prior_probs = idata.constant_data["prior_w"].to_numpy()
 
     # Extract posterior mu and sigma
     mu_samples = idata.posterior["mu"].values  # (chains, draws, k, n_features)
@@ -215,7 +389,7 @@ def compute_posterior_assignments(
     S_full = mu_samples.shape[0] * mu_samples.shape[1]
     k = mu_samples.shape[2]
     n_features = mu_samples.shape[3]
-    n_points = X_scaled.shape[0]
+    n_points = obs_data.shape[0]
 
     mu_flat = mu_samples.reshape(-1, k, n_features)  # (S_full, k, d)
     sigma_flat = sigma_samples.reshape(-1, k, n_features)
@@ -228,7 +402,7 @@ def compute_posterior_assignments(
         # shape -> (n_points, k)
         log_lik = np.stack(
             [
-                scipy_norm.logpdf(X_scaled, loc=mu_mean[kk], scale=sigma_mean[kk]).sum(
+                scipy_norm.logpdf(obs_data, loc=mu_mean[kk], scale=sigma_mean[kk]).sum(
                     axis=1
                 )
                 for kk in range(k)
@@ -260,7 +434,7 @@ def compute_posterior_assignments(
             # for each component kk compute logpdf across features and sum
             for kk in range(k):
                 lp = scipy_norm.logpdf(
-                    X_scaled, loc=mu_flat[s, kk], scale=sigma_flat[s, kk]
+                    obs_data, loc=mu_flat[s, kk], scale=sigma_flat[s, kk]
                 )  # (n_points, d)
                 log_lik = lp.sum(axis=1)  # (n_points,)
                 log_prior = np.log(prior_probs[:, kk] + 1e-12)  # (n_points,)
@@ -280,14 +454,88 @@ def compute_posterior_assignments(
     return posterior_probs, cluster_pred, uncertainty
 
 
+def compute_entropy(posterior_probs: np.ndarray) -> np.ndarray:
+    """Compute per-point entropy from posterior probabilities.
+
+    Args:
+        posterior_probs: Array ``(n_points, k)`` with responsibilities.
+    Returns:
+        np.ndarray: Entropy per point, shape ``(n_points,)``.
+    """
+    return -np.sum(posterior_probs * np.log(posterior_probs + 1e-12), axis=1)
+
+
+def compute_max_probs(
+    posterior_probs: np.ndarray, cluster_pred: np.ndarray
+) -> np.ndarray:
+    """Compute per-point maximum posterior probability from cluster assignments.
+
+    Args:
+        posterior_probs: Array ``(n_points, k)`` with responsibilities.
+        cluster_pred: Array ``(n_points,)`` with hard labels per point.
+    Returns:
+        np.ndarray: Maximum posterior probability per point, shape ``(n_points,)``.
+    """
+    return posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
+
+
+def get_model_parameters_from_idata(
+    idata: az.InferenceData,
+    scaler: Any | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Extract model parameters from ArviZ InferenceData object.
+
+    Args:
+        idata: ArviZ ``InferenceData`` containing posterior draws for ``mu`` and ``sigma``.
+        scaler: Optional scaler to inverse-transform the selected feature (applied to model parameters if provided).
+        feature_index: Feature index to report ``μ/σ`` for (default ``0``).
+
+    Returns:
+        Tuple[np.ndarray | None, np.ndarray | None]: Arrays ``(k,)`` with posterior means for ``mu`` and ``sigma`` for the selected feature, or ``None`` if not available.
+    """
+
+    if "mu" not in idata.posterior or "sigma" not in idata.posterior:
+        logger.error(
+            "InferenceData does not contain 'mu' or 'sigma' in posterior. Cannot extract model parameters."
+        )
+        return None, None
+
+    mu_arr = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
+    sigma_arr = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
+
+    # Ensure shapes (k, n_features)
+    if mu_arr.ndim == 1:
+        mu_arr = mu_arr[:, None]
+        sigma_arr = sigma_arr[:, None]
+
+    # Optionally inverse-transform
+    if scaler is not None:
+        # Ensure the number of features matches with scaler: expects shape (n_samples, n_features)
+        n_features = mu_arr.shape[1]
+        if n_features != scaler.scale_.shape[0]:
+            logger.error(
+                f"Model parameters have {n_features} features, but scaler expects {scaler.scale_.shape[0]}."
+            )
+            return None, None
+
+        # Inverse-transform μ
+        mu_arr = scaler.inverse_transform(mu_arr)
+
+        # Inverse-transform σ with feature scale (Robust/Standard scalers expose scale_)
+        scale_vec = getattr(scaler, "scale_", None)
+        if scale_vec is not None:
+            sigma_arr = sigma_arr * scale_vec
+
+    return mu_arr, sigma_arr
+
+
 def compute_cluster_statistics(
+    *,
     df_features: pd.DataFrame,
     cluster_pred: np.ndarray,
     posterior_probs: np.ndarray,
-    *,
     idata: Any | None = None,
     scaler: Any | None = None,
-    feature_index: int = 0,
 ) -> dict[int, dict[str, float]]:
     """
     Compute per-cluster statistics independently of plotting.
@@ -310,35 +558,18 @@ def compute_cluster_statistics(
             ``avg_entropy``, ``avg_assignment_prob``, ``model_mu``, ``model_sigma``.
     """
     # Per-point entropy_pt and max posterior prob
-    entropy_pt = -np.sum(posterior_probs * np.log(posterior_probs + 1e-12), axis=1)
-    max_prob_pt = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
+    entropy_pt = compute_entropy(posterior_probs)
+    max_prob_pt = compute_max_probs(posterior_probs, cluster_pred)
 
     # Optional model μ/σ from posterior means
-    model_mu = None
-    model_sigma = None
-    if idata is not None and "mu" in idata.posterior and "sigma" in idata.posterior:
-        mu_arr = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
-        sigma_arr = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
-        # Ensure shapes (k, n_features)
-        if mu_arr.ndim == 1:
-            mu_arr = mu_arr[:, None]
-            sigma_arr = sigma_arr[:, None]
-        # Select requested feature
-        model_mu = mu_arr[:, feature_index].copy()
-        model_sigma = sigma_arr[:, feature_index].copy()
-        # Optionally inverse-transform
-        if scaler is not None:
-            # Inverse-transform μ: expects shape (n_samples, n_features)
-            mu_sel = mu_arr[:, [feature_index]]
-            model_mu = scaler.inverse_transform(mu_sel)[:, 0]
-            # Scale σ with feature scale (Robust/Standard scalers expose scale_)
-            scale_vec = getattr(scaler, "scale_", None)
-            if scale_vec is not None:
-                model_sigma = model_sigma * scale_vec[feature_index]
+    if idata is not None:
+        model_mu, model_sigma = get_model_parameters_from_idata(idata, scaler)
+    else:
+        model_mu, model_sigma = None, None
 
     velocity = df_features["V"].to_numpy()
     stats: dict[int, dict[str, float]] = {}
-    for label in np.unique(cluster_pred):
+    for i, label in enumerate(np.unique(cluster_pred)):
         mask = cluster_pred == label
         count = int(mask.sum())
         if count == 0:
@@ -359,6 +590,24 @@ def compute_cluster_statistics(
         avg_entropy = float(entropy_pt[mask].mean())
         avg_prob = float(max_prob_pt[mask].mean())
 
+        # Model parameters for the selected cluster
+        if model_mu is not None and model_sigma is not None:
+            if model_mu.shape[0] != len(np.unique(cluster_pred)):
+                logger.warning(
+                    "Number of clusters in model parameters does not match number of unique cluster labels."
+                )
+                model_mu_val = None
+                model_sigma_val = None
+            elif model_mu.shape[1] > 1:
+                model_mu_val = model_mu[i, :]
+                model_sigma_val = model_sigma[i, :]
+            else:
+                model_mu_val = float(model_mu[i])
+                model_sigma_val = float(model_sigma[i])
+        else:
+            model_mu_val = None
+            model_sigma_val = None
+
         entry = {
             "count": count,
             "x_mean": x_mean,
@@ -371,20 +620,16 @@ def compute_cluster_statistics(
             "velocity_nmad": nmad,
             "avg_entropy": avg_entropy,
             "avg_assignment_prob": avg_prob,
-            "model_mu": None,
-            "model_sigma": None,
+            "model_mu": model_mu_val,
+            "model_sigma": model_sigma_val,
         }
-        if model_mu is not None and model_sigma is not None:
-            # Assumes label indexes components directly
-            entry["model_mu"] = float(model_mu[label])
-            entry["model_sigma"] = float(model_sigma[label])
 
         stats[int(label)] = entry
 
     return stats
 
 
-def plot_1d_velocity_clustering(
+def plot_velocity_clustering(
     df_features: pd.DataFrame,
     img: Image.Image | np.ndarray | None,
     *,
@@ -392,7 +637,7 @@ def plot_1d_velocity_clustering(
     cluster_pred: np.ndarray,
     posterior_probs: np.ndarray,
     scaler: Any | None = None,
-) -> tuple[Figure, np.ndarray, dict[int, dict[str, float]]]:
+) -> Figure:
     """Plot 1D velocity clustering results for marginalized model.
 
     Args:
@@ -404,22 +649,8 @@ def plot_1d_velocity_clustering(
         scaler: Optional scaler to inverse-transform model parameters for overlay.
 
     Returns:
-        Tuple[Figure, np.ndarray, Dict[int, Dict[str, float]]]:
-            Matplotlib figure, uncertainty (entropy) per point, and the statistics
-            dictionary returned by ``compute_cluster_statistics``.
+        Figure: Matplotlib figure containing the 4 subplots.
     """
-
-    # Per-point uncertainty (entropy) for scatter plot and return value
-    entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-12), axis=1)
-    # Max probs can be useful for debugging/annotation; compute if needed
-    # max_probs = posterior_probs[np.arange(len(cluster_pred)), cluster_pred]
-
-    # Get model parameters for overlay (posterior means)
-    mu_posterior = idata.posterior["mu"].mean(dim=["chain", "draw"]).values.flatten()
-    sigma_posterior = (
-        idata.posterior["sigma"].mean(dim=["chain", "draw"]).values.flatten()
-    )
-
     # Distinct colors
     unique_labels = np.unique(cluster_pred)
     colors = [
@@ -438,159 +669,348 @@ def plot_1d_velocity_clustering(
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    # Plot 1: Velocity field with quiver plot
-    ax0 = axes[0, 0]
-    ax0.set_title("Velocity Vector Field", fontsize=14, pad=10)
-    if img is not None:
-        ax0.imshow(img, alpha=0.5, cmap="gray")
-    magnitudes = df_features["V"].to_numpy()
-    vmin = 0.0
-    vmax = np.max(magnitudes)
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    q = ax0.quiver(
-        df_features["x"].to_numpy(),
-        df_features["y"].to_numpy(),
-        df_features["u"].to_numpy(),
-        df_features["v"].to_numpy(),
-        magnitudes,
-        scale=None,
-        scale_units="xy",
-        angles="xy",
-        cmap="viridis",
-        norm=norm,
-        width=0.008,
-        headwidth=2.5,
-        alpha=1.0,
-    )
-    cbar = fig.colorbar(q, ax=ax0, shrink=0.8, aspect=20, pad=0.02)
-    cbar.set_label("Velocity Magnitude", rotation=270, labelpad=15)
-    ax0.set_aspect("equal")
-    ax0.set_xticks([])
-    ax0.set_yticks([])
-    ax0.grid(False)
+    try:
+        # Plot 1: Velocity field with quiver plot
+        ax0 = axes[0, 0]
+        ax0.set_title("Velocity Vector Field", fontsize=14, pad=10)
+        if img is not None:
+            ax0.imshow(img, alpha=0.5, cmap="gray")
+        magnitudes = df_features["V"].to_numpy()
+        vmin = 0.0
+        vmax = np.max(magnitudes)
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        q = ax0.quiver(
+            df_features["x"].to_numpy(),
+            df_features["y"].to_numpy(),
+            df_features["u"].to_numpy(),
+            df_features["v"].to_numpy(),
+            magnitudes,
+            scale=None,
+            scale_units="xy",
+            angles="xy",
+            cmap="viridis",
+            norm=norm,
+            width=0.008,
+            headwidth=2.5,
+            alpha=1.0,
+        )
+        cbar = fig.colorbar(q, ax=ax0, shrink=0.8, aspect=20, pad=0.02)
+        cbar.set_label("Velocity Magnitude", rotation=270, labelpad=15)
+        ax0.set_aspect("equal")
+        ax0.set_xticks([])
+        ax0.set_yticks([])
+        ax0.grid(False)
 
-    # Plot 2: Spatial clusters
-    ax1 = axes[0, 1]
-    ax1.set_title("Velocity-Based Spatial Clustering", fontsize=14, pad=10)
-    if img is not None:
-        ax1.imshow(img, alpha=0.3, cmap="gray")
-    for label in unique_labels:
-        mask = cluster_pred == label
-        if np.any(mask):
-            ax1.scatter(
-                df_features.loc[mask, "x"],
-                df_features.loc[mask, "y"],
-                c=color_map[label],
-                s=8,
-                alpha=0.8,
-                label=f"Cluster {label}",
-                edgecolors="none",
+        # Plot 2: Spatial clusters
+        ax1 = axes[0, 1]
+        ax1.set_title("Velocity-Based Spatial Clustering", fontsize=14, pad=10)
+        if img is not None:
+            ax1.imshow(img, alpha=0.3, cmap="gray")
+        for label in unique_labels:
+            mask = cluster_pred == label
+            if np.any(mask):
+                ax1.scatter(
+                    df_features.loc[mask, "x"],
+                    df_features.loc[mask, "y"],
+                    c=color_map[label],
+                    s=8,
+                    alpha=0.8,
+                    label=f"Cluster {label}",
+                    edgecolors="none",
+                )
+        ax1.legend(loc="upper right", framealpha=0.9, fontsize=10)
+        ax1.set_aspect("equal")
+        ax1.set_xticks([])
+        ax1.set_yticks([])
+
+        # Plot 3: Per-point uncertainty (entropy)
+        entropy = compute_entropy(posterior_probs)
+        ax2 = axes[1, 0]
+        ax2.set_title("Assignment Uncertainty (Entropy)", fontsize=14, pad=10)
+        if img is not None:
+            ax2.imshow(img, alpha=0.3, cmap="gray")
+        scatter = ax2.scatter(
+            df_features["x"],
+            df_features["y"],
+            c=entropy,
+            cmap="plasma",
+            s=8,
+            alpha=0.8,
+            vmin=0,
+            vmax=entropy.max(),
+        )
+        ax2.set_aspect("equal")
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+        cbar2 = plt.colorbar(scatter, ax=ax2, shrink=0.8)
+        cbar2.set_label("Entropy", rotation=270, labelpad=20)
+
+        # Plot 4: Velocity distribution by cluster
+        ax3 = axes[1, 1]
+        ax3.set_title("Velocity Distribution by Cluster", fontsize=14, pad=10)
+        velocity = df_features["V"].values
+        for label in unique_labels:
+            mask = cluster_pred == label
+            if np.any(mask):
+                ax3.hist(
+                    velocity[mask],
+                    bins=35,
+                    alpha=0.7,
+                    density=True,
+                    color=color_map[label],
+                    label=f"Cluster {label}",
+                    edgecolor="white",
+                    linewidth=0.5,
+                )
+
+        # Overlay model distributions
+        # Get model parameters for overlay (posterior means)
+        mu_posterior, sigma_posterior = get_model_parameters_from_idata(
+            idata, scaler=scaler
+        )
+        if mu_posterior is None or sigma_posterior is None:
+            raise ValueError(
+                "Model parameters not available in InferenceData for overlay."
             )
-    ax1.legend(loc="upper right", framealpha=0.9, fontsize=10)
-    ax1.set_aspect("equal")
-    ax1.set_xticks([])
-    ax1.set_yticks([])
 
-    # Plot 3: Assignment uncertainty (entropy)
-    ax2 = axes[1, 0]
-    ax2.set_title("Assignment Uncertainty (Entropy)", fontsize=14, pad=10)
-    if img is not None:
-        ax2.imshow(img, alpha=0.3, cmap="gray")
-    scatter = ax2.scatter(
-        df_features["x"],
-        df_features["y"],
-        c=entropy,
-        cmap="plasma",
-        s=8,
-        alpha=0.8,
-        vmin=0,
-        vmax=entropy.max(),
-    )
-    ax2.set_aspect("equal")
-    ax2.set_xticks([])
-    ax2.set_yticks([])
-    cbar2 = plt.colorbar(scatter, ax=ax2, shrink=0.8)
-    cbar2.set_label("Entropy", rotation=270, labelpad=20)
+        # Group model parameters by cluster label
+        if mu_posterior.shape[0] != len(unique_labels):
+            raise ValueError(
+                "Number of model clusters does not match number of unique labels. Cannot overlay model distributions."
+            )
 
-    # Plot 4: Velocity distribution by cluster
-    ax3 = axes[1, 1]
-    ax3.set_title("Velocity Distribution by Cluster", fontsize=14, pad=10)
-    velocity = df_features["V"].values
-    for label in unique_labels:
-        mask = cluster_pred == label
-        if np.any(mask):
-            ax3.hist(
-                velocity[mask],
-                bins=35,
-                alpha=0.7,
-                density=True,
+        mu_posterior = {
+            label: mu_posterior[i, 0] for i, label in enumerate(unique_labels)
+        }
+        sigma_posterior = {
+            label: sigma_posterior[i, 0] for i, label in enumerate(unique_labels)
+        }
+
+        # Ensure numpy array for range computation
+        velocity_arr = np.asarray(velocity)
+        v_range = np.linspace(
+            float(np.min(velocity_arr)), float(np.max(velocity_arr)), 200
+        )
+        for label in unique_labels:
+            model_dist = scipy_norm.pdf(
+                v_range,
+                mu_posterior[label],
+                sigma_posterior[label],
+            )
+            ax3.plot(
+                v_range,
+                model_dist,
+                "--",
                 color=color_map[label],
-                label=f"Cluster {label}",
-                edgecolor="white",
-                linewidth=0.5,
+                linewidth=2.5,
+                alpha=0.9,
+                label=f"Model {label}",
             )
-    # Overlay model distributions
-    # Ensure numpy array for range computation
-    velocity_arr = np.asarray(velocity)
-    v_range = np.linspace(float(np.min(velocity_arr)), float(np.max(velocity_arr)), 200)
-    for label in unique_labels:
-        if scaler is not None:
-            mu_orig = scaler.inverse_transform([[mu_posterior[label]]])[0, 0]
-            sigma_orig = sigma_posterior[label] * scaler.scale_[0]
-        else:
-            mu_orig = mu_posterior[label]
-            sigma_orig = sigma_posterior[label]
-        model_dist = scipy_norm.pdf(v_range, mu_orig, sigma_orig)
-        ax3.plot(
-            v_range,
-            model_dist,
-            "--",
-            color=color_map[label],
-            linewidth=2.5,
-            alpha=0.9,
-            label=f"Model {label}",
-        )
-    ax3.set_xlabel("Velocity Magnitude", fontsize=12)
-    ax3.set_ylabel("Density", fontsize=12)
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(fontsize=10, framealpha=0.9)
+        ax3.set_xlabel("Velocity Magnitude", fontsize=12)
+        ax3.set_ylabel("Density", fontsize=12)
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(fontsize=10, framealpha=0.9)
 
-    # Render statistics box
-    stats = compute_cluster_statistics(
-        df_features,
-        cluster_pred,
-        posterior_probs,
+        # Render statistics box
+        stats = compute_cluster_statistics(
+            df_features=df_features,
+            cluster_pred=cluster_pred,
+            posterior_probs=posterior_probs,
+            idata=idata,
+            scaler=scaler,
+        )
+        if not stats:
+            raise ValueError("Unable to compute cluster statistics (no clusters?)")
+
+        fig.subplots_adjust(right=0.98)
+        stats_text = "CLUSTER STATISTICS\n" + "=" * 40 + "\n"
+        for label in sorted(stats.keys()):
+            s = stats[label]
+            stats_text += f"CLUSTER {label} (pts: {s['count']})\n"
+            stats_text += f"├─ Center: ({s['x_mean']:.1f}, {s['y_mean']:.1f})\n"
+            stats_text += f"├─ Spread: (σx={s['x_std']:.1f}, σy={s['y_std']:.1f})\n"
+            stats_text += (
+                f"├─ Velocity: {s['velocity_mean']:.4f} ± {s['velocity_std']:.4f}\n"
+            )
+            stats_text += (
+                f"├─ Median/NMAD: {s['velocity_median']:.4f}/{s['velocity_nmad']:.4f}\n"
+            )
+            if s["model_mu"] is not None and s["model_sigma"] is not None:
+
+                def _fmt(v):
+                    arr = np.asarray(v)
+                    if arr.size == 1:
+                        return f"{float(arr.item()):.4f}"
+                    return ", ".join(f"{float(x):.4f}" for x in arr.ravel())
+
+                model_mu_str = _fmt(s["model_mu"])
+                model_sigma_str = _fmt(s["model_sigma"])
+                stats_text += f"├─ Model μ: {model_mu_str}\n"
+                stats_text += f"├─ Model σ: {model_sigma_str}\n"
+
+            stats_text += f"├─ Avg Entropy: {s['avg_entropy']:.4f}\n"
+            stats_text += f"└─ Avg Assignment Prob: {s['avg_assignment_prob']:.4f}\n\n"
+
+        fig.text(
+            0.72,
+            0.05,
+            stats_text,
+            fontsize=8,
+            verticalalignment="bottom",
+            fontfamily="monospace",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8),
+        )
+    except Exception as exc:
+        logger.error(f"Error generating clustering plots: {exc}")
+    finally:
+        plt.tight_layout(rect=(0, 0, 0.7, 1))
+
+    return fig
+
+
+def postprocess_mcmc_results(
+    idata: az.InferenceData,
+    df: pd.DataFrame,
+    scaler,
+    img,
+    output_dir: Path,
+    base_name: str,
+    sigma: float | int | None = None,
+    n_posterior_samples: int = 200,
+):
+    """
+    Compute posterior assignments, generate and optionally save diagnostic plots and summaries.
+    """
+
+    scale_str = f"_scale{sigma}" if sigma is not None else ""
+
+    # compute cluster assignments
+    posterior_probs, cluster_pred, uncertainty = compute_posterior_assignments(
+        idata, n_posterior_samples=n_posterior_samples
+    )
+    fig = plot_velocity_clustering(
+        df_features=df,
+        img=img,
         idata=idata,
+        cluster_pred=cluster_pred,
+        posterior_probs=posterior_probs,
         scaler=scaler,
-        feature_index=0,
     )
-    fig.subplots_adjust(right=0.98)
-    stats_text = "CLUSTER STATISTICS\n" + "=" * 40 + "\n"
-    for label in sorted(stats.keys()):
-        s = stats[label]
-        stats_text += f"CLUSTER {label} (pts: {s['count']})\n"
-        stats_text += f"├─ Center: ({s['x_mean']:.1f}, {s['y_mean']:.1f})\n"
-        stats_text += f"├─ Spread: (σx={s['x_std']:.1f}, σy={s['y_std']:.1f})\n"
-        stats_text += (
-            f"├─ Velocity: {s['velocity_mean']:.4f} ± {s['velocity_std']:.4f}\n"
-        )
-        stats_text += (
-            f"├─ Median/NMAD: {s['velocity_median']:.4f}/{s['velocity_nmad']:.4f}\n"
-        )
-        if s["model_mu"] is not None and s["model_sigma"] is not None:
-            stats_text += f"├─ Model μ/σ: {s['model_mu']:.4f}/{s['model_sigma']:.4f}\n"
-        stats_text += f"├─ Avg Entropy: {s['avg_entropy']:.4f}\n"
-        stats_text += f"└─ Avg Assignment Prob: {s['avg_assignment_prob']:.4f}\n\n"
-
-    fig.text(
-        0.72,
-        0.05,
-        stats_text,
-        fontsize=8,
-        verticalalignment="bottom",
-        fontfamily="monospace",
-        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8),
+    fig.savefig(
+        output_dir / f"{base_name}_results{scale_str}.png",
+        dpi=300,
+        bbox_inches="tight",
     )
 
-    plt.tight_layout(rect=(0, 0, 0.7, 1))
-    return fig, entropy, stats
+    # Trace plots
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    az.plot_trace(
+        idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
+    )
+    fig.savefig(output_dir / f"{base_name}_trace_plots{scale_str}.png", dpi=150)
+
+    # Forest plots
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    az.plot_forest(idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes)
+    fig.savefig(output_dir / f"{base_name}_forest_plot{scale_str}.png", dpi=150)
+
+    logger.info(f"Postprocessing outputs saved to {output_dir}")
+
+    plt.close(fig)
+
+    return posterior_probs, cluster_pred, uncertainty
+
+
+def plot_velocity_magnitude(x, y, V, img=None, ax=None, label: str | None = None):
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    if img is not None:
+        ax.imshow(img, alpha=0.5, cmap="gray")
+    q = ax.scatter(
+        x,
+        y,
+        c=V,
+        cmap="viridis",
+        s=10,
+        alpha=0.6,
+    )
+    cbar = plt.colorbar(q, ax=ax, fraction=0.05, pad=0.04)
+    if label is None:
+        label = "Velocity magnitude"
+    cbar.set_label(label, rotation=270, labelpad=15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.tight_layout()
+
+    return ax
+
+
+def collect_run_metadata(
+    idata: az.InferenceData,
+    convergence_flag: bool,
+    data_array_scaled: np.ndarray,
+    variables_names: list,
+    sectors: dict,
+    prior_probs: np.ndarray,
+    sample_args: dict,
+    **kwargs,
+) -> dict:
+    """Automatically collect metadata from current variables and context."""
+
+    logger.warning(
+        "This function is temporary and it will be replaced by a more structured configuration system."
+    )
+
+    # Get variables from current namespace/globals
+    frame = kwargs.get("frame", globals())
+
+    metadata = {
+        "experiment": {
+            "name": frame.get("base_name", "unknown_experiment"),
+            "timestamp": datetime.now().isoformat(),
+            "random_seed": frame.get("RANDOM_SEED", None),
+        },
+        "data": {
+            "camera_name": frame.get("camera_name"),
+            "reference_start_date": frame.get("reference_start_date"),
+            "reference_end_date": frame.get("reference_end_date"),
+            "dt_min_hours": frame.get("dt_min"),
+            "dt_max_hours": frame.get("dt_max"),
+            "subsample_factor": frame.get("SUBSAMPLE_FACTOR"),
+            "subsample_method": frame.get("SUBSAMPLE_METHOD"),
+            "filter_kwargs": frame.get("filter_kwargs"),
+            "roi_path": str(frame.get("roi_path", "")),
+            "sector_prior_file": str(frame.get("SECTOR_PRIOR_FILE", "")),
+            "multiscale": "sigma_values" in frame,
+            "gaussian_smoothing_scales": frame.get("sigma_values"),
+            "n_observations": data_array_scaled.shape[0],
+            "n_dic_analyses": len(frame.get("dic_ids", [])),
+        },
+        "model": {
+            "type": "marginalized_mixture",
+            "n_clusters": len(sectors),
+            "n_features": data_array_scaled.shape[1],
+            "feature_names": variables_names,
+            "prior_specification": "spatial_sectors",
+            "sectors": list(sectors.keys()),
+            "prior_probabilities": frame.get("PRIOR_PROBABILITY"),
+            "prior_shape": prior_probs.shape,
+        },
+        "sampling": sample_args,
+        "convergence": {
+            "converged": convergence_flag,
+            "summary_stats": az.summary(idata, var_names=["mu", "sigma"]).to_dict(),
+        },
+    }
+
+    return metadata
+
+
+def save_run_metadata(
+    output_dir: Path, base_name: str, metadata: dict, suffix: str = ""
+):
+    """Save metadata JSON with optional suffix."""
+    metadata_file = output_dir / f"{base_name}_metadata{suffix}.json"
+    with open(metadata_file, "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
+    logger.info(f"Experiment metadata saved to {metadata_file}")

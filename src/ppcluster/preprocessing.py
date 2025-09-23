@@ -1,92 +1,17 @@
 import logging
+from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from matplotlib.path import Path as MplPath
 from scipy import ndimage
 from scipy.spatial import cKDTree
-from sklearn.preprocessing import StandardScaler
+
+from ppcluster.cvat import _parse_polygon_points, read_mask_element_from_cvat
 
 logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
-
-
-def preproc_features(df):
-    """
-    Create additional features for clustering glacier displacement data
-    """
-    df_features = df.copy()
-
-    # Direction angle (in radians and degrees)
-    df_features["angle_rad"] = np.arctan2(df["v"], df["u"])
-    df_features["angle_deg"] = np.degrees(df_features["angle_rad"])
-
-    # Convert negative angles to positive (0-360 degrees)
-    df_features["angle_deg"] = (df_features["angle_deg"] + 360) % 360
-
-    # Directional components (unit vectors)
-    df_features["u_unit"] = df["u"] / (df["V"] + 1e-10)  # Avoid division by zero
-    df_features["v_unit"] = df["v"] / (df["V"] + 1e-10)
-
-    # Square Magnitude of displacement
-    df_features["V_squared"] = df["V"] ** 2
-
-    # Log magnitude for better clustering of different scales
-    df_features["log_magnitude"] = np.log1p(df["V"])
-
-    # Magnitude categories
-    magnitude_percentiles = np.percentile(df["V"], [25, 50, 75])
-    df_features["magnitude_category"] = pd.cut(
-        df["V"],
-        bins=[0] + list(magnitude_percentiles) + [np.inf],
-        labels=["low", "medium", "high", "very_high"],
-    )
-
-    return df_features
-
-
-def normalize_data(
-    df,
-    spatial_weight=0.3,
-    velocity_weight=0.7,
-    spatial_features_names=None,
-    velocity_features_names=None,
-):
-    """
-    Custom clustering approach that considers both spatial proximity and velocity similarity
-
-    Parameters:
-    - spatial_weight: weight for spatial coordinates (x, y)
-    - velocity_weight: weight for velocity features (u, v, magnitude, direction)
-    """
-
-    if spatial_features_names is None:
-        spatial_features_names = ["x", "y"]
-    if velocity_features_names is None:
-        velocity_features_names = ["u", "v", "V", "angle_deg"]
-
-    # Prepare features for clustering
-    spatial_features = df[spatial_features_names].values
-    velocity_features = df[velocity_features_names].values
-
-    # Normalize features separately
-    spatial_scaler = StandardScaler()
-    velocity_scaler = StandardScaler()
-
-    spatial_normalized = spatial_scaler.fit_transform(spatial_features)
-    velocity_normalized = velocity_scaler.fit_transform(velocity_features)
-
-    # Create a DataFrame with normalized features
-    normalized_df = pd.DataFrame(
-        np.hstack(
-            [
-                spatial_normalized * spatial_weight,
-                velocity_normalized * velocity_weight,
-            ]
-        ),
-        columns=spatial_features_names + velocity_features_names,
-    )
-
-    return normalized_df, spatial_scaler, velocity_scaler
 
 
 def apply_dic_filters(
@@ -146,6 +71,64 @@ def apply_dic_filters(
         f"(removed {len(df) - len(df_filtered)} total)"
     )
 
+    return df_filtered
+
+
+def filter_dataframe_by_masks(
+    xml_source: str | Path,
+    df: pd.DataFrame,
+    x_col: str = "x",
+    y_col: str = "y",
+    exclude_labels: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Filter dataframe using polygonal <mask> annotations from a CVAT XML.
+
+    - If no masks are present in the CVAT file, the original dataframe is returned unchanged.
+    - If masks are present, points are kept if they fall in the union of mask polygons.
+    - exclude_labels can be used to ignore masks by label.
+    """
+    raise NotImplementedError("This function not yet tested/verified")
+
+    exclude = set(exclude_labels or ())
+    masks = read_mask_element_from_cvat(
+        xml_source, image_name=None, exclude_labels=exclude
+    )
+    if not masks:
+        logger.info(
+            "No CVAT masks found at %s — skipping CVAT mask filtering", xml_source
+        )
+        return df
+
+    x_vals = df[x_col].to_numpy()
+    y_vals = df[y_col].to_numpy()
+    pts_xy = np.column_stack((x_vals, y_vals))
+    include_mask = np.zeros(len(df), dtype=bool)
+
+    for mask_info in masks:
+        label = mask_info.get("label", "")
+        pts_str = mask_info.get("points", None)
+        if not pts_str:
+            logger.debug("Mask '%s' has no 'points' attribute; skipping", label)
+            continue
+        try:
+            verts = _parse_polygon_points(pts_str)  # (N,2)
+            if verts.shape[0] < 3:
+                logger.debug("Mask '%s' has fewer than 3 vertices; skipping", label)
+                continue
+            # ensure closed polygon for MplPath.contains_points behaviour
+            if not np.allclose(verts[0], verts[-1]):
+                verts = np.vstack([verts, verts[0]])
+            path = MplPath(verts)
+            hit = path.contains_points(pts_xy)
+            include_mask |= hit
+            logger.info("Mask '%s': %d points inside", label, int(hit.sum()))
+        except Exception as exc:
+            logger.warning("Failed to parse/apply mask '%s': %s", label, exc)
+            continue
+
+    df_filtered = df.loc[include_mask].reset_index(drop=True)
+    logger.info("Data shape after CVAT mask filtering: %s", df_filtered.shape)
     return df_filtered
 
 
@@ -446,24 +429,8 @@ def spatial_subsample(df, n_subsample=5, method="regular"):
         )
         df_sub = df.sample(n=min(n_samples, len(df)), random_state=RANDOM_SEED).copy()
 
-    elif method == "stratified":
-        # Stratified sampling based on spatial grid
-        x_bins = np.linspace(df["x"].min(), df["x"].max(), int(np.sqrt(len(df) / 100)))
-        y_bins = np.linspace(df["y"].min(), df["y"].max(), int(np.sqrt(len(df) / 100)))
-
-        df_temp = df.copy()
-        df_temp["x_bin"] = pd.cut(df_temp["x"], x_bins, labels=False)
-        df_temp["y_bin"] = pd.cut(df_temp["y"], y_bins, labels=False)
-
-        # Sample from each spatial bin
-        df_sub = (
-            df_temp.groupby(["x_bin", "y_bin"])
-            .apply(
-                lambda x: x.sample(min(n_subsample, len(x)), random_state=RANDOM_SEED)
-            )
-            .reset_index(drop=True)
-        )
-        df_sub = df_sub.drop(["x_bin", "y_bin"], axis=1)
+    else:
+        raise ValueError(f"Unknown subsampling method: {method}")
 
     print(
         f"Subsampled from {len(df)} to {len(df_sub)} points ({len(df_sub) / len(df) * 100:.1f}%)"
