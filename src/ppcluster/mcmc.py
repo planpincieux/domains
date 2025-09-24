@@ -21,6 +21,19 @@ logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
 rng = np.random.default_rng(RANDOM_SEED)
 
+COLORMAP = plt.get_cmap("tab10")
+# COLOR_LIST = [
+#     "#E31A1C",
+#     "#1F78B4",
+#     "#33A02C",
+#     "#FF7F00",
+#     "#6A3D9A",
+#     "#B15928",
+#     "#A6CEE3",
+#     "#B2DF8A",
+#     "#FB9A99",
+#     "#FDBF6F",
+# ]
 
 """ MCMC"""
 
@@ -386,7 +399,7 @@ def compute_posterior_assignments(
     sigma_samples = idata.posterior["sigma"].values
 
     # collapse chain/draw dims
-    S_full = mu_samples.shape[0] * mu_samples.shape[1]
+    # S_full = mu_samples.shape[0] * mu_samples.shape[1]
     k = mu_samples.shape[2]
     n_features = mu_samples.shape[3]
     n_points = obs_data.shape[0]
@@ -494,14 +507,14 @@ def get_model_parameters_from_idata(
         Tuple[np.ndarray | None, np.ndarray | None]: Arrays ``(k,)`` with posterior means for ``mu`` and ``sigma`` for the selected feature, or ``None`` if not available.
     """
 
-    if "mu" not in idata.posterior or "sigma" not in idata.posterior:
+    if "mu" not in idata.posterior or "sigma" not in idata.posterior:  # type: ignore
         logger.error(
             "InferenceData does not contain 'mu' or 'sigma' in posterior. Cannot extract model parameters."
         )
         return None, None
 
-    mu_arr = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
-    sigma_arr = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
+    mu_arr = idata.posterior["mu"].mean(dim=["chain", "draw"]).values  # type: ignore
+    sigma_arr = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values  # type: ignore
 
     # Ensure shapes (k, n_features)
     if mu_arr.ndim == 1:
@@ -653,18 +666,9 @@ def plot_velocity_clustering(
     """
     # Distinct colors
     unique_labels = np.unique(cluster_pred)
-    colors = [
-        "#E31A1C",
-        "#1F78B4",
-        "#33A02C",
-        "#FF7F00",
-        "#6A3D9A",
-        "#B15928",
-        "#A6CEE3",
-        "#B2DF8A",
-        "#FB9A99",
-        "#FDBF6F",
-    ][: len(unique_labels)]
+
+    # USE DEFAULT COLORMAP
+    colors = [COLORMAP(i) for i in range(len(unique_labels))]
     color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -727,6 +731,9 @@ def plot_velocity_clustering(
         entropy = compute_entropy(posterior_probs)
         ax2 = axes[1, 0]
         ax2.set_title("Assignment Uncertainty (Entropy)", fontsize=14, pad=10)
+        vmin = 0.0
+        vmax = max(entropy.max(), 0.1)  # Ensure non-zero range
+        norm = Normalize(vmin=vmin, vmax=vmax)
         if img is not None:
             ax2.imshow(img, alpha=0.3, cmap="gray")
         scatter = ax2.scatter(
@@ -736,8 +743,7 @@ def plot_velocity_clustering(
             cmap="plasma",
             s=8,
             alpha=0.8,
-            vmin=0,
-            vmax=entropy.max(),
+            norm=norm,
         )
         ax2.set_aspect("equal")
         ax2.set_xticks([])
@@ -881,6 +887,7 @@ def postprocess_mcmc_results(
     """
     Compute posterior assignments, generate and optionally save diagnostic plots and summaries.
     """
+    logger.warning("This function will be removed in future versions.")
 
     scale_str = f"_scale{sigma}" if sigma is not None else ""
 
