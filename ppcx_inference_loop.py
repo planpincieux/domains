@@ -25,7 +25,7 @@ from ppcluster.preprocessing import (
     apply_dic_filters,
 )
 from ppcluster.roi import PolygonROISelector
-from ppcx_inference_func import (
+from ppcx_postproc_func import (
     close_small_holes,
     compute_cluster_statistics_simple,
     create_2d_grid,

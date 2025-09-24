@@ -11,11 +11,6 @@ from scipy.spatial import cKDTree
 
 logger = logging.getLogger("ppcx")
 
-#######
-
-
-########
-
 
 def create_2d_grid(
     x: np.ndarray,
@@ -106,58 +101,6 @@ def remove_small_grid_components(label_grid, min_size=5, connectivity=8):
                 else:
                     cleaned[comp_mask] = np.nan
     return cleaned
-
-
-def plot_cluster_labels_on_image(
-    df_features,
-    img,
-    cluster_pred,
-    ax=None,
-    title="Velocity-Based Spatial Clustering",
-    markersize=8,
-):
-    """Plot cluster labels over optional background image."""
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
-    ax.set_title(title, fontsize=14, pad=10)
-    if img is not None:
-        ax.imshow(img, alpha=0.3, cmap="gray")
-
-    unique_labels = np.unique(cluster_pred)
-    # reserve a color for noise / NaN mapped to -1
-    noise_label = -1
-    labels_no_noise = [lab for lab in sorted(unique_labels) if lab != noise_label]
-
-    # build a discrete colormap sized to the number of non-noise labels
-    n = max(1, len(labels_no_noise))
-    cmap = plt.cm.get_cmap("tab20", n)
-    colors_arr = [cmap(i) for i in range(n)]
-
-    color_map = {}
-    for i, lab in enumerate(labels_no_noise):
-        color_map[lab] = colors_arr[i]
-    # assign noise color
-    if noise_label in unique_labels:
-        color_map[noise_label] = "#7f7f7f"
-
-    for label in sorted(unique_labels):
-        mask = cluster_pred == label
-        if np.any(mask):
-            ax.scatter(
-                df_features.loc[mask, "x"],
-                df_features.loc[mask, "y"],
-                c=[color_map[label]],
-                s=markersize,
-                alpha=0.8,
-                label=f"Cluster {label}",
-                edgecolors="none",
-            )
-
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=10)
-    ax.set_aspect("equal")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    return ax
 
 
 def close_small_holes(
@@ -323,27 +266,72 @@ def split_disconnected_components(label_grid, connectivity=8, start_label=0):
     return new_grid, mapping
 
 
-def map_grid_to_points(X, Y, label_grid, df, x_col="x", y_col="y", nan_fill=-1):
+def map_grid_to_points(
+    X,
+    Y,
+    label_grid,
+    x_points,
+    y_points,
+    keep_nan=True,
+    nan_fill=-1,
+):
     """
-    Map values from a 2D grid (label_grid) back to the original points in df.
-    - X, Y: meshgrid returned by create_2d_grid (X.shape == label_grid.shape).
-    - label_grid: 2D array with labels (np.nan = empty).
-    - df: DataFrame with point coordinates.
-    - x_col, y_col: column names in df for coordinates.
-    - nan_fill: integer value to use when grid cell is NaN (default -1).
+    Map values from a 2D grid (label_grid) back to query points.
+
+    Parameters:
+    -----------
+    X, Y : numpy.ndarray
+        Meshgrid arrays returned by create_2d_grid (X.shape == label_grid.shape)
+    label_grid : numpy.ndarray
+        2D array with labels (np.nan = empty cells)
+    x_points, y_points : numpy.ndarray
+        1D arrays of query point coordinates
+    keep_nan : bool, default=True
+        If True, keep NaN points and fill with nan_fill value
+        If False, filter out NaN points and return filtered coordinates
+    nan_fill : int, default=-1
+        Value to use when grid cell is NaN (only used if keep_nan=True)
+
     Returns:
-      numpy integer array of length len(df) with mapped labels.
+    --------
+        tuple : (labels, x, y)
+            - label: Array of mapped labels (excluding NaN points if keep_nan=False)
+            - x: Array of x coordinates (excluding NaN points if keep_nan=False)
+            - y: Array of y coordinates (excluding NaN points if keep_nan=False)
     """
+    # Ensure inputs are numpy arrays
+    x_points = np.asarray(x_points)
+    y_points = np.asarray(y_points)
+
+    if len(x_points) != len(y_points):
+        raise ValueError("x_points and y_points must have the same length")
+
+    # Extract grid coordinates
     x_grid = X[0, :]
     y_grid = Y[:, 0]
-    pts = df[[x_col, y_col]].to_numpy()
-    out = np.full(pts.shape[0], nan_fill, dtype=int)
-    for i, (xi, yi) in enumerate(pts):
+
+    # Initialize output array
+    n_points = len(x_points)
+    labels = np.full(n_points, nan_fill, dtype=int)
+
+    # Map each point to nearest grid cell
+    for i, (xi, yi) in enumerate(zip(x_points, y_points, strict=False)):
+        # Find nearest grid indices
         ix = np.argmin(np.abs(x_grid - xi))
         iy = np.argmin(np.abs(y_grid - yi))
+
+        # Get grid value
         val = label_grid[iy, ix]
-        out[i] = nan_fill if np.isnan(val) else int(val)
-    return out
+        labels[i] = nan_fill if np.isnan(val) else int(val)
+
+    if not keep_nan:
+        # Filter out NaN points
+        valid_mask = labels != nan_fill
+        labels = labels[valid_mask]
+        x_points = x_points[valid_mask]
+        y_points = y_points[valid_mask]
+
+    return labels, x_points, y_points
 
 
 def compute_cluster_statistics_simple(
@@ -423,6 +411,58 @@ def compute_cluster_statistics_simple(
         }
 
     return stats
+
+
+def plot_cluster_labels_on_image(
+    df_features,
+    img,
+    cluster_pred,
+    ax=None,
+    title="Velocity-Based Spatial Clustering",
+    markersize=8,
+):
+    """Plot cluster labels over optional background image."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_title(title, fontsize=14, pad=10)
+    if img is not None:
+        ax.imshow(img, alpha=0.3, cmap="gray")
+
+    unique_labels = np.unique(cluster_pred)
+    # reserve a color for noise / NaN mapped to -1
+    noise_label = -1
+    labels_no_noise = [lab for lab in sorted(unique_labels) if lab != noise_label]
+
+    # build a discrete colormap sized to the number of non-noise labels
+    n = max(1, len(labels_no_noise))
+    cmap = plt.cm.get_cmap("tab20", n)
+    colors_arr = [cmap(i) for i in range(n)]
+
+    color_map = {}
+    for i, lab in enumerate(labels_no_noise):
+        color_map[lab] = colors_arr[i]
+    # assign noise color
+    if noise_label in unique_labels:
+        color_map[noise_label] = "#7f7f7f"
+
+    for label in sorted(unique_labels):
+        mask = cluster_pred == label
+        if np.any(mask):
+            ax.scatter(
+                df_features.loc[mask, "x"],
+                df_features.loc[mask, "y"],
+                c=[color_map[label]],
+                s=markersize,
+                alpha=0.8,
+                label=f"Cluster {label}",
+                edgecolors="none",
+            )
+
+    ax.legend(loc="upper right", framealpha=0.9, fontsize=10)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    return ax
 
 
 def plot_1d_velocity_clustering_simple(
