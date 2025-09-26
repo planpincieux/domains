@@ -218,6 +218,7 @@ def get_dic_analysis_by_ids(
         query = """
         SELECT 
             DIC.id as dic_id,
+            DIC.reference_date,
             CAM.camera_name,
             DIC.master_timestamp,
             DIC.slave_timestamp,
