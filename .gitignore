@@ -1,5 +1,6 @@
 .env
 .vscode/
+.directory
 smb_mount.sh
 sandbox/
 figures/
@@ -15,7 +16,7 @@ output*/
 data*/
 nohup.out
 .log
-.logs
+.logs/
 
 # Django #  
 *.log
