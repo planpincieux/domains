@@ -5,6 +5,7 @@ from datetime import datetime
 import pandas as pd
 import requests
 from PIL import Image
+from sqlalchemy import create_engine, text
 
 from ppcluster.utils.config import ConfigManager
 
@@ -314,7 +315,6 @@ def get_multi_dic_data(
 def get_image(
     image_id: int,
     *,
-    camera_name: str | None = None,
     app_host: str | None = None,
     app_port: str | None = None,
     config: ConfigManager | None = None,
@@ -328,6 +328,26 @@ def get_image(
     response = requests.get(url)
     if response.status_code == 200:
         img = Image.open(io.BytesIO(response.content))
+
+        # Get camera name to check if rotation is needed
+        camera_name = None
+
+        if config is not None:
+            db_engine = create_engine(config.db_url)
+            query = f"""
+                SELECT camera_name
+                FROM ppcx_app_image as image
+                JOIN ppcx_app_camera as camera
+                ON image.camera_id = camera.id
+                WHERE image.id={image_id};
+            """
+            with db_engine.connect() as conn:
+                result = conn.execute(text(query))
+                camera_name = result.scalar_one_or_none()
+        else:
+            logger.warning(
+                "ConfigManager not provided, cannot check camera name for rotation."
+            )
         # Rotate if camera_name is Tele (portrait mode)
         if camera_name is not None and "tele" in camera_name.lower():
             img = img.rotate(90, expand=True)  # 90° clockwise

@@ -28,7 +28,6 @@ from ppcluster.mcmc.postproc import (
 from ppcluster.preprocessing import (
     apply_dic_filters,
 )
-from ppcluster.utils.roi import PolygonROISelector
 from ppcluster.utils.config import ConfigManager
 from ppcluster.utils.database import (
     get_dic_analysis_by_ids,
@@ -36,6 +35,7 @@ from ppcluster.utils.database import (
     get_dic_data,
     get_image,
 )
+from ppcluster.utils.roi import PolygonROISelector
 
 # Use non-interactive backend for matplotlib
 plt.switch_backend("Agg")

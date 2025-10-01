@@ -1,10 +1,10 @@
 # Database configuration
 database:
-  host: "150.145.51.193"
-  port: 5432
-  name: "planpincieux"
-  user: ""
-  password: ""
+  host: null
+  port: null
+  name: null
+  user: null
+  password: null
 
 # API configuration
 api:
