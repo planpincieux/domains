@@ -1,17 +1,66 @@
 import logging
-from collections.abc import Sequence
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from matplotlib.path import Path as MplPath
 from scipy import ndimage
-from scipy.spatial import cKDTree
-
-from ppcluster.cvat import _parse_polygon_points, read_mask_element_from_cvat
 
 logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
+
+
+def create_2d_grid_from_df(
+    df: pd.DataFrame, grid_spacing: float | None = None
+) -> tuple:
+    """
+    Create a 2D grid from scattered DIC points.
+
+    Args:
+        df: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
+        grid_spacing: Spacing between grid points. If None, estimated from data
+
+    Returns:
+        tuple: (x_grid, y_grid, u_grid, v_grid, v_mag_grid, valid_mask)
+    """
+    if grid_spacing is None:
+        # Estimate grid spacing from minimum distances
+        points = df[["x", "y"]].values
+        x_unique = np.unique(points[:, 0])
+        y_unique = np.unique(points[:, 1])
+        grid_spacing = float(
+            np.mean([np.min(np.diff(x_unique)), np.min(np.diff(y_unique))])
+        )
+        logger.info(f"Estimated grid spacing: {grid_spacing:.2f}")
+
+    # Create regular grid
+    x_min, x_max = df["x"].min(), df["x"].max()
+    y_min, y_max = df["y"].min(), df["y"].max()
+
+    x_grid = np.arange(x_min, x_max + grid_spacing, grid_spacing)
+    y_grid = np.arange(y_min, y_max + grid_spacing, grid_spacing)
+
+    # Create meshgrid
+    X, Y = np.meshgrid(x_grid, y_grid)
+
+    # Initialize grids
+    u_grid = np.full_like(X, np.nan)
+    v_grid = np.full_like(Y, np.nan)
+    v_mag_grid = np.full_like(X, np.nan)
+
+    # Map points to grid
+    for _, row in df.iterrows():
+        i = np.argmin(np.abs(y_grid - row["y"]))
+        j = np.argmin(np.abs(x_grid - row["x"]))
+
+        u_grid[i, j] = row["u"]
+        v_grid[i, j] = row["v"]
+        v_mag_grid[i, j] = row["V"]
+
+    # Create valid mask
+    valid_mask = ~np.isnan(v_mag_grid)
+
+    logger.info(f"Created 2D grid: {X.shape}, {np.sum(valid_mask)} valid points")
+
+    return X, Y, u_grid, v_grid, v_mag_grid, valid_mask
 
 
 def apply_dic_filters(
@@ -74,64 +123,6 @@ def apply_dic_filters(
     return df_filtered
 
 
-def filter_dataframe_by_masks(
-    xml_source: str | Path,
-    df: pd.DataFrame,
-    x_col: str = "x",
-    y_col: str = "y",
-    exclude_labels: Sequence[str] | None = None,
-) -> pd.DataFrame:
-    """
-    Filter dataframe using polygonal <mask> annotations from a CVAT XML.
-
-    - If no masks are present in the CVAT file, the original dataframe is returned unchanged.
-    - If masks are present, points are kept if they fall in the union of mask polygons.
-    - exclude_labels can be used to ignore masks by label.
-    """
-    raise NotImplementedError("This function not yet tested/verified")
-
-    exclude = set(exclude_labels or ())
-    masks = read_mask_element_from_cvat(
-        xml_source, image_name=None, exclude_labels=exclude
-    )
-    if not masks:
-        logger.info(
-            "No CVAT masks found at %s — skipping CVAT mask filtering", xml_source
-        )
-        return df
-
-    x_vals = df[x_col].to_numpy()
-    y_vals = df[y_col].to_numpy()
-    pts_xy = np.column_stack((x_vals, y_vals))
-    include_mask = np.zeros(len(df), dtype=bool)
-
-    for mask_info in masks:
-        label = mask_info.get("label", "")
-        pts_str = mask_info.get("points", None)
-        if not pts_str:
-            logger.debug("Mask '%s' has no 'points' attribute; skipping", label)
-            continue
-        try:
-            verts = _parse_polygon_points(pts_str)  # (N,2)
-            if verts.shape[0] < 3:
-                logger.debug("Mask '%s' has fewer than 3 vertices; skipping", label)
-                continue
-            # ensure closed polygon for MplPath.contains_points behaviour
-            if not np.allclose(verts[0], verts[-1]):
-                verts = np.vstack([verts, verts[0]])
-            path = MplPath(verts)
-            hit = path.contains_points(pts_xy)
-            include_mask |= hit
-            logger.info("Mask '%s': %d points inside", label, int(hit.sum()))
-        except Exception as exc:
-            logger.warning("Failed to parse/apply mask '%s': %s", label, exc)
-            continue
-
-    df_filtered = df.loc[include_mask].reset_index(drop=True)
-    logger.info("Data shape after CVAT mask filtering: %s", df_filtered.shape)
-    return df_filtered
-
-
 def filter_outliers_by_percentile(
     df: pd.DataFrame, tails_percentile: float = 0.01, velocity_column: str = "V"
 ) -> pd.DataFrame:
@@ -190,61 +181,6 @@ def filter_by_min_velocity(
     return df_filtered
 
 
-def create_2d_grid(df: pd.DataFrame, grid_spacing: float | None = None) -> tuple:
-    """
-    Create a 2D grid from scattered DIC points.
-
-    Args:
-        df: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
-        grid_spacing: Spacing between grid points. If None, estimated from data
-
-    Returns:
-        tuple: (x_grid, y_grid, u_grid, v_grid, v_mag_grid, valid_mask)
-    """
-    if grid_spacing is None:
-        # Estimate grid spacing from minimum distances
-        points = df[["x", "y"]].values
-        tree = cKDTree(points)
-        distances, _ = tree.query(
-            points, k=2
-        )  # k=2 to get distance to nearest neighbor
-        grid_spacing = np.median(
-            distances[:, 1]
-        )  # distances[:, 1] is distance to nearest neighbor
-        logger.info(f"Estimated grid spacing: {grid_spacing:.2f}")
-
-    # Create regular grid
-    x_min, x_max = df["x"].min(), df["x"].max()
-    y_min, y_max = df["y"].min(), df["y"].max()
-
-    x_grid = np.arange(x_min, x_max + grid_spacing, grid_spacing)
-    y_grid = np.arange(y_min, y_max + grid_spacing, grid_spacing)
-
-    # Create meshgrid
-    X, Y = np.meshgrid(x_grid, y_grid)
-
-    # Initialize grids
-    u_grid = np.full_like(X, np.nan)
-    v_grid = np.full_like(Y, np.nan)
-    v_mag_grid = np.full_like(X, np.nan)
-
-    # Map points to grid
-    for _, row in df.iterrows():
-        i = np.argmin(np.abs(y_grid - row["y"]))
-        j = np.argmin(np.abs(x_grid - row["x"]))
-
-        u_grid[i, j] = row["u"]
-        v_grid[i, j] = row["v"]
-        v_mag_grid[i, j] = row["V"]
-
-    # Create valid mask
-    valid_mask = ~np.isnan(v_mag_grid)
-
-    logger.info(f"Created 2D grid: {X.shape}, {np.sum(valid_mask)} valid points")
-
-    return X, Y, u_grid, v_grid, v_mag_grid, valid_mask
-
-
 def apply_2d_median_filter(
     df: pd.DataFrame,
     window_size: int | None = 5,
@@ -260,7 +196,7 @@ def apply_2d_median_filter(
     )
 
     # Create 2D grid from scattered points
-    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid(df)
+    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid_from_df(df)
 
     # Prepare work arrays with NaNs where invalid
     u_work = u_grid.copy().astype(float)
@@ -347,7 +283,7 @@ def apply_2d_gaussian_filter(
     logger.info(f"Applying 2D Gaussian filter (u,v,V): sigma={sigma}")
 
     # Build grid from points
-    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid(df)
+    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid_from_df(df)
 
     if not np.any(valid_mask):
         logger.warning(
