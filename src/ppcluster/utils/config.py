@@ -16,6 +16,9 @@ class ConfigManager:
     _config: DictConfig | None = field(default=None, init=False, repr=False)
     config_path: Path = field(default=CONFIG_PATH)
 
+    def __repr__(self) -> str:
+        return f"ConfigManager(config_path={self.config_path}, config={self.config})"
+
     def __new__(cls, config_path: Path = CONFIG_PATH):
         """Create a singleton instance of ConfigManager."""
         if cls._instance is None:
