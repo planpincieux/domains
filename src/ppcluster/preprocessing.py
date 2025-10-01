@@ -1,66 +1,17 @@
 import logging
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 from scipy import ndimage
 
+from ppcluster.griddata import create_2d_grid_from_df
+
 logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
 
 
-def create_2d_grid_from_df(
-    df: pd.DataFrame, grid_spacing: float | None = None
-) -> tuple:
-    """
-    Create a 2D grid from scattered DIC points.
-
-    Args:
-        df: DataFrame with columns 'x', 'y', 'u', 'v', 'V'
-        grid_spacing: Spacing between grid points. If None, estimated from data
-
-    Returns:
-        tuple: (x_grid, y_grid, u_grid, v_grid, v_mag_grid, valid_mask)
-    """
-    if grid_spacing is None:
-        # Estimate grid spacing from minimum distances
-        points = df[["x", "y"]].values
-        x_unique = np.unique(points[:, 0])
-        y_unique = np.unique(points[:, 1])
-        grid_spacing = float(
-            np.mean([np.min(np.diff(x_unique)), np.min(np.diff(y_unique))])
-        )
-        logger.info(f"Estimated grid spacing: {grid_spacing:.2f}")
-
-    # Create regular grid
-    x_min, x_max = df["x"].min(), df["x"].max()
-    y_min, y_max = df["y"].min(), df["y"].max()
-
-    x_grid = np.arange(x_min, x_max + grid_spacing, grid_spacing)
-    y_grid = np.arange(y_min, y_max + grid_spacing, grid_spacing)
-
-    # Create meshgrid
-    X, Y = np.meshgrid(x_grid, y_grid)
-
-    # Initialize grids
-    u_grid = np.full_like(X, np.nan)
-    v_grid = np.full_like(Y, np.nan)
-    v_mag_grid = np.full_like(X, np.nan)
-
-    # Map points to grid
-    for _, row in df.iterrows():
-        i = np.argmin(np.abs(y_grid - row["y"]))
-        j = np.argmin(np.abs(x_grid - row["x"]))
-
-        u_grid[i, j] = row["u"]
-        v_grid[i, j] = row["v"]
-        v_mag_grid[i, j] = row["V"]
-
-    # Create valid mask
-    valid_mask = ~np.isnan(v_mag_grid)
-
-    logger.info(f"Created 2D grid: {X.shape}, {np.sum(valid_mask)} valid points")
-
-    return X, Y, u_grid, v_grid, v_mag_grid, valid_mask
+# === GRID data filtering ===
 
 
 def apply_dic_filters(
@@ -181,105 +132,18 @@ def filter_by_min_velocity(
     return df_filtered
 
 
-def apply_2d_median_filter(
-    df: pd.DataFrame,
-    window_size: int | None = 5,
-    threshold_factor: float | None = 3.0,
-) -> pd.DataFrame:
-    """
-    Apply 2D median filter to remove outliers based on local neighborhood.
-    Now evaluates u, v and V components. A point is removed if any component
-    is an outlier relative to its local median +/- threshold_factor * MAD.
-    """
-    logger.info(
-        f"Applying 2D median filter (u,v,V): window_size={window_size}, threshold_factor={threshold_factor}"
-    )
-
-    # Create 2D grid from scattered points
-    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid_from_df(df)
-
-    # Prepare work arrays with NaNs where invalid
-    u_work = u_grid.copy().astype(float)
-    v_work = v_grid.copy().astype(float)
-    V_work = v_mag_grid.copy().astype(float)
-
-    u_work[~valid_mask] = np.nan
-    v_work[~valid_mask] = np.nan
-    V_work[~valid_mask] = np.nan
-
-    size = int(window_size) if window_size is not None else 5
-
-    # Helper to compute nanmedian with generic_filter
-    nanmedian = lambda arr: float(np.nanmedian(arr))
-
-    u_median = ndimage.generic_filter(
-        u_work, function=nanmedian, size=size, mode="constant", cval=np.nan
-    )
-    v_median = ndimage.generic_filter(
-        v_work, function=nanmedian, size=size, mode="constant", cval=np.nan
-    )
-    V_median = ndimage.generic_filter(
-        V_work, function=nanmedian, size=size, mode="constant", cval=np.nan
-    )
-
-    # compute local MAD (median of absolute deviations)
-    u_abs_dev = np.abs(u_work - u_median)
-    v_abs_dev = np.abs(v_work - v_median)
-    V_abs_dev = np.abs(V_work - V_median)
-
-    u_mad = ndimage.generic_filter(
-        u_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
-    )
-    v_mad = ndimage.generic_filter(
-        v_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
-    )
-    V_mad = ndimage.generic_filter(
-        V_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
-    )
-
-    # thresholding (avoid zero MAD by adding tiny eps)
-    eps = 1e-12
-    outlier_u = (
-        np.abs(u_work - u_median) > (threshold_factor * (u_mad + eps))
-    ) & valid_mask
-    outlier_v = (
-        np.abs(v_work - v_median) > (threshold_factor * (v_mad + eps))
-    ) & valid_mask
-    outlier_V = (
-        np.abs(V_work - V_median) > (threshold_factor * (V_mad + eps))
-    ) & valid_mask
-
-    # combined outlier: any component flagged
-    outlier_mask = outlier_u | outlier_v | outlier_V
-
-    n_outliers = int(np.sum(outlier_mask))
-    logger.info(f"Detected {n_outliers} outliers (u/v/V combined) in 2D median filter")
-
-    # Build list of valid indices to keep (not an outlier)
-    keep_indices = []
-    for idx, row in df.iterrows():
-        i = np.argmin(np.abs(Y[:, 0] - row["y"]))
-        j = np.argmin(np.abs(X[0, :] - row["x"]))
-        if not outlier_mask[i, j]:
-            keep_indices.append(idx)
-
-    df_filtered = df.iloc[keep_indices].reset_index(drop=True)
-    logger.info(
-        f"2D median filtering (u,v,V): {len(df)} -> {len(df_filtered)} points (removed {len(df) - len(df_filtered)})"
-    )
-    return df_filtered
-
-
-def apply_2d_gaussian_filter(
-    df: pd.DataFrame, sigma: float | None = 1.0
-) -> pd.DataFrame:
+def apply_2d_gaussian_filter(df: pd.DataFrame, sigma: float = 1.0) -> pd.DataFrame:
     """
     Smooth u, v and velocity magnitude with a 2D Gaussian filter.
 
     - Uses mask-normalized gaussian filtering to respect missing cells.
     - Maps smoothed grid values back to original points.
     """
-    sigma = sigma or 1.0
+
+    if sigma <= 0:
+        logger.info("Gaussian smoothing disabled (sigma <= 0)")
+        return df
+
     logger.info(f"Applying 2D Gaussian filter (u,v,V): sigma={sigma}")
 
     # Build grid from points
@@ -341,8 +205,98 @@ def apply_2d_gaussian_filter(
     return df_out
 
 
+def apply_2d_median_filter(
+    df: pd.DataFrame,
+    window_size: int | None = 5,
+    threshold_factor: float | None = 3.0,
+) -> pd.DataFrame:
+    """
+    Apply 2D median filter to remove outliers based on local neighborhood.
+    Now evaluates u, v and V components. A point is removed if any component
+    is an outlier relative to its local median +/- threshold_factor * MAD.
+    """
+    logger.info(
+        f"Applying 2D median filter (u,v,V): window_size={window_size}, threshold_factor={threshold_factor}"
+    )
+
+    # Create 2D grid from scattered points
+    X, Y, u_grid, v_grid, v_mag_grid, valid_mask = create_2d_grid_from_df(df)
+
+    # Prepare work arrays with NaNs where invalid
+    u_work = u_grid.copy().astype(float)
+    v_work = v_grid.copy().astype(float)
+    V_work = v_mag_grid.copy().astype(float)
+
+    u_work[~valid_mask] = np.nan
+    v_work[~valid_mask] = np.nan
+    V_work[~valid_mask] = np.nan
+
+    size = int(window_size) if window_size is not None else 5
+
+    # Helper to compute nanmedian with generic_filter
+    def nanmedian(arr):
+        return float(np.nanmedian(arr))
+
+    u_median = ndimage.generic_filter(
+        u_work, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    v_median = ndimage.generic_filter(
+        v_work, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    V_median = ndimage.generic_filter(
+        V_work, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+
+    # compute local MAD (median of absolute deviations)
+    u_abs_dev = np.abs(u_work - u_median)
+    v_abs_dev = np.abs(v_work - v_median)
+    V_abs_dev = np.abs(V_work - V_median)
+
+    u_mad = ndimage.generic_filter(
+        u_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    v_mad = ndimage.generic_filter(
+        v_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+    V_mad = ndimage.generic_filter(
+        V_abs_dev, function=nanmedian, size=size, mode="constant", cval=np.nan
+    )
+
+    # thresholding (avoid zero MAD by adding tiny eps)
+    eps = 1e-12
+    outlier_u = (
+        np.abs(u_work - u_median) > (threshold_factor * (u_mad + eps))
+    ) & valid_mask
+    outlier_v = (
+        np.abs(v_work - v_median) > (threshold_factor * (v_mad + eps))
+    ) & valid_mask
+    outlier_V = (
+        np.abs(V_work - V_median) > (threshold_factor * (V_mad + eps))
+    ) & valid_mask
+
+    # combined outlier: any component flagged
+    outlier_mask = outlier_u | outlier_v | outlier_V
+
+    n_outliers = int(np.sum(outlier_mask))
+    logger.info(f"Detected {n_outliers} outliers (u/v/V combined) in 2D median filter")
+
+    # Build list of valid indices to keep (not an outlier)
+    keep_indices = []
+    for idx, row in df.iterrows():
+        i = np.argmin(np.abs(Y[:, 0] - row["y"]))
+        j = np.argmin(np.abs(X[0, :] - row["x"]))
+        if not outlier_mask[i, j]:
+            keep_indices.append(idx)
+
+    df_filtered = df.iloc[keep_indices].reset_index(drop=True)
+    logger.info(
+        f"2D median filtering (u,v,V): {len(df)} -> {len(df_filtered)} points (removed {len(df) - len(df_filtered)})"
+    )
+    return df_filtered
+
+
 # === SPATIAL SUBSAMPLING ===
-def spatial_subsample(df, n_subsample=5, method="regular"):
+def spatial_subsample(df, n_subsample=5, method="regular", random_state=RANDOM_SEED):
     """
     Subsample DIC data spatially to reduce computational load.
 
@@ -363,7 +317,7 @@ def spatial_subsample(df, n_subsample=5, method="regular"):
             if n_subsample < 1
             else int(len(df) / n_subsample)
         )
-        df_sub = df.sample(n=min(n_samples, len(df)), random_state=RANDOM_SEED).copy()
+        df_sub = df.sample(n=min(n_samples, len(df)), random_state=random_state).copy()
 
     else:
         raise ValueError(f"Unknown subsampling method: {method}")
@@ -372,3 +326,214 @@ def spatial_subsample(df, n_subsample=5, method="regular"):
         f"Subsampled from {len(df)} to {len(df_sub)} points ({len(df_sub) / len(df) * 100:.1f}%)"
     )
     return df_sub
+
+
+# === Feature preprocessing ===
+def preprocess_velocity_features(
+    velocities: np.ndarray,
+    velocity_transform: str = "power",
+    velocity_params: dict | None = None,
+):
+    """
+    Preprocess velocity features with various transformation options.
+
+    Parameters:
+    -----------
+    velocities : numpy.ndarray
+        1D array of velocity magnitudes
+    velocity_transform : str, default="power"
+        Type of velocity transformation: "power", "exponential", "threshold", "sigmoid", or "none"
+    velocity_params : dict, optional
+        Parameters for velocity transformation. Defaults depend on transform type:
+        - "power": {"exponent": 2}
+        - "exponential": {"scale": 0.2}
+        - "threshold": {"threshold_percentile": 50, "enhancement": 3.0}
+        - "sigmoid": {"midpoint_percentile": 70, "steepness": 2.0}
+        - "none": {}
+
+            Returns:
+    --------
+    tuple : (velocities_transformed, transform_info)
+        - velocities_transformed: numpy.ndarray of transformed velocities
+        - transform_info: Dictionary with transformation metadata
+    """
+    # Ensure input is numpy array
+    velocities = np.asarray(velocities)
+
+    # Set default velocity transformation parameters
+    if velocity_params is None:
+        velocity_params = {
+            "power": {"exponent": 2},
+            "exponential": {"scale": 0.2},
+            "threshold": {"threshold_percentile": 50, "enhancement": 3.0},
+            "sigmoid": {"midpoint_percentile": 70, "steepness": 2.0},
+            "none": {},
+        }.get(velocity_transform, {})
+
+    # Apply velocity transformation
+    if velocity_transform == "power":
+        exponent = velocity_params.get("exponent", 2)
+        velocities_transformed = velocities**exponent
+        transform_info = {"type": "power", "exponent": exponent}
+
+    elif velocity_transform == "exponential":
+        scale = velocity_params.get("scale", 0.2)
+        velocities_transformed = np.exp(scale * velocities) - 1
+        transform_info = {"type": "exponential", "scale": scale}
+
+    elif velocity_transform == "threshold":
+        threshold_percentile = velocity_params.get("threshold_percentile", 50)
+        enhancement = velocity_params.get("enhancement", 3.0)
+        threshold = np.percentile(velocities, threshold_percentile)
+        velocities_transformed = np.where(
+            velocities > threshold,
+            velocities * enhancement,
+            velocities,
+        )
+        transform_info = {
+            "type": "threshold",
+            "threshold": threshold,
+            "enhancement": enhancement,
+        }
+
+    elif velocity_transform == "sigmoid":
+        midpoint_percentile = velocity_params.get("midpoint_percentile", 70)
+        steepness = velocity_params.get("steepness", 2.0)
+        midpoint = np.percentile(velocities, midpoint_percentile)
+        velocities_transformed = 1 / (1 + np.exp(-steepness * (velocities - midpoint)))
+        transform_info = {
+            "type": "sigmoid",
+            "midpoint": midpoint,
+            "steepness": steepness,
+        }
+
+    else:  # "none" or any other value
+        logger.info("No velocity transformation applied.")
+        return velocities, {"type": "none"}
+
+    logger.info(
+        f"Applied {velocity_transform} transformation with params: {velocity_params}"
+    )
+    logger.info(f"Feature shape: {velocities_transformed.shape}")
+
+    return velocities_transformed, transform_info
+
+
+def compute_second_derivative_feature(
+    grid_values: np.ndarray,
+    *,
+    x_coords: np.ndarray | None = None,
+    y_coords: np.ndarray | None = None,
+    spacing: float | tuple[float, float] | None = None,
+    direction: Literal["x", "y", "gradient"] = "gradient",
+    order: Literal[1, 2] = 2,
+    edge_order: int = 2,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """
+    Compute directional derivatives for a 2D gridded scalar field.
+
+    Parameters
+    ----------
+    grid_values : numpy.ndarray
+        Scalar field on a regular grid with shape (ny, nx).
+    x_coords, y_coords : array-like, optional
+        Coordinate axes for the grid. If omitted, evenly spaced coordinates are generated
+        from ``spacing`` (or unit spacing if not provided).
+    spacing : float or tuple(float, float), optional
+        Grid spacing (dy, dx). Overrides the spacing inferred from ``x_coords``/``y_coords``.
+    direction : {"x", "y", "gradient"}, default "gradient"
+        Direction of the derivative. Use "gradient" to obtain derivatives along both axes.
+    order : {1, 2}, default 2
+        Derivative order. ``order=1`` yields first derivatives, ``order=2`` yields second derivatives.
+    edge_order : int, default 2
+        Edge handling order passed to ``numpy.gradient``.
+
+    Returns
+    -------
+    numpy.ndarray or tuple of numpy.ndarray
+        Derivative grid(s) with the same shape as ``grid_values``. When ``direction="gradient"``,
+        a tuple ``(d/dy, d/dx)`` is returned. For ``order=2`` the tuple contains the second
+        directional derivatives.
+
+    Raises
+    ------
+    ValueError
+        If the input grid is not 2D, spacing is invalid, or the direction/order is unsupported.
+    """
+    field = np.asarray(grid_values, float)
+    if field.ndim != 2:
+        raise ValueError("grid_values must be a 2D array.")
+
+    def _spacing_from_input(sp_value, idx):
+        if sp_value is None:
+            return None
+        if np.isscalar(sp_value):
+            val = float(sp_value)
+        else:
+            seq = tuple(sp_value)
+            if len(seq) != 2:
+                raise ValueError(
+                    "spacing must be a float or a tuple of two floats (dy, dx)."
+                )
+            val = float(seq[idx])
+        if val <= 0:
+            raise ValueError("Spacing values must be positive.")
+        return val
+
+    def _build_axis(size, coords, sp_value, idx):
+        if coords is not None:
+            axis_vals = np.asarray(coords, float)
+            if axis_vals.size != size:
+                raise ValueError(
+                    f"Expected {size} coordinates for axis {idx}, received {axis_vals.size}."
+                )
+            return axis_vals
+        step = sp_value if sp_value is not None else 1.0
+        return np.arange(size, dtype=float) * step
+
+    spacing_y = _spacing_from_input(spacing, 0)
+    spacing_x = _spacing_from_input(spacing, 1)
+
+    y_axis = _build_axis(field.shape[0], y_coords, spacing_y, 0)
+    x_axis = _build_axis(field.shape[1], x_coords, spacing_x, 1)
+
+    def _axis_spacing(axis_vals):
+        if axis_vals.size < 2:
+            return 1.0
+        diffs = np.diff(axis_vals)
+        diffs = diffs[np.abs(diffs) > 0]
+        if diffs.size == 0:
+            return 1.0
+        return float(np.mean(diffs))
+
+    dy = spacing_y if spacing_y is not None else _axis_spacing(y_axis)
+    dx = spacing_x if spacing_x is not None else _axis_spacing(x_axis)
+    if dy <= 0 or dx <= 0:
+        raise ValueError("Computed grid spacing must be positive.")
+
+    def _directional_derivative(axis: int) -> np.ndarray:
+        step = dy if axis == 0 else dx
+        first = np.gradient(field, step, axis=axis, edge_order=edge_order)
+        if order == 1:
+            return first
+        if order == 2:
+            return np.gradient(first, step, axis=axis, edge_order=edge_order)
+        raise ValueError("order must be either 1 or 2.")
+
+    direction_norm = str(direction).lower()
+    if direction_norm in {"y", "vertical"}:
+        result = _directional_derivative(0)
+    elif direction_norm in {"x", "horizontal"}:
+        result = _directional_derivative(1)
+    elif direction_norm in {"gradient", "both"}:
+        result = (_directional_derivative(0), _directional_derivative(1))
+    else:
+        raise ValueError("direction must be 'x', 'y', or 'gradient'.")
+
+    logger.debug(
+        "Computed %s derivative(s) (order=%d) on grid shape %s",
+        direction_norm,
+        order,
+        field.shape,
+    )
+    return result

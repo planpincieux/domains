@@ -1,51 +1,131 @@
 import logging
+from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from PIL import Image
 from scipy import ndimage
+from scipy.stats import mode
+from sklearn.metrics import adjusted_rand_score
 
 logger = logging.getLogger("ppcx")
 
 
-def create_2d_grid(
-    x: np.ndarray,
-    y: np.ndarray,
-    labels: np.ndarray | None = None,
-    grid_spacing: float | None = None,
+# == Multiscale clustering aggregation ===
+def aggregate_multiscale_clustering(
+    results, similarity_threshold=0.6, overall_threshold=0.7, fig_path=None
 ):
-    if grid_spacing is None:
-        # Estimate grid spacing from minimum distances
-        x_unique = np.unique(x)
-        y_unique = np.unique(y)
-        grid_spacing = float(
-            np.mean([np.min(np.diff(x_unique)), np.min(np.diff(y_unique))])
+    """
+    Aggregate clustering results across scales, filtering unstable scales.
+
+    Parameters:
+    -----------
+    results : list of dict
+        Results from different scale clustering runs
+    similarity_threshold : float
+        Minimum mean similarity for a scale to be included
+    overall_threshold : float
+        Minimum overall similarity across scales to accept results
+
+    Returns:
+    --------
+    combined_cluster_pred : ndarray
+        Aggregated cluster assignments
+    stability_score : float
+        Measure of overall stability (0-1)
+    """
+
+    # Extract all cluster predictions
+    all_cluster_preds = np.array([res["cluster_pred"] for res in results])
+    n_scales = len(all_cluster_preds)
+    sigma_values = [res["sigma"] for res in results]
+
+    # Calculate pairwise similarities
+    similarity_matrix = np.zeros((n_scales, n_scales))
+    np.fill_diagonal(similarity_matrix, 1.0)
+    for i, j in combinations(range(n_scales), 2):
+        sim = adjusted_rand_score(all_cluster_preds[i], all_cluster_preds[j])
+        similarity_matrix[i, j] = sim
+        similarity_matrix[j, i] = sim
+
+    # Plot similarity heatmap
+    if fig_path is not None:
+        fig_path = Path(fig_path)
+        fig_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(4, 4))
+        sns.heatmap(
+            similarity_matrix,
+            annot=True,
+            fmt=".2f",
+            cmap="viridis",
+            xticklabels=sigma_values,
+            yticklabels=sigma_values,
         )
-        logger.info(f"Estimated grid spacing: {grid_spacing:.2f}")
+        plt.title("Adjusted Rand Index Between Scales")
+        plt.xlabel("Sigma")
+        plt.ylabel("Sigma")
+        plt.tight_layout()
+        fig.savefig(fig_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
 
-    # Create regular grid
-    x_min, x_max = x.min(), x.max()
-    y_min, y_max = y.min(), y.max()
-    x_grid = np.arange(x_min, x_max + grid_spacing, grid_spacing)
-    y_grid = np.arange(y_min, y_max + grid_spacing, grid_spacing)
+    # Calculate mean similarity for each scale (exclude self-similarity)
+    mean_similarities = (similarity_matrix.sum(axis=1) - 1) / (n_scales - 1)
 
-    # Create meshgrid
-    X, Y = np.meshgrid(x_grid, y_grid)
+    # Filter scales with low similarity
+    valid_scales = mean_similarities >= similarity_threshold
+    if not np.any(valid_scales):
+        raise ValueError(
+            f"No scales meet the similarity threshold of {similarity_threshold}. "
+            f"Mean similarities: {mean_similarities}"
+        )
 
-    # Initialize with NaN for no label
-    label_grid = np.full(X.shape, np.nan)
+    # Get overall stability score (mean of valid scale similarities)
+    valid_sim_matrix = similarity_matrix[np.ix_(valid_scales, valid_scales)]
+    stability_score = valid_sim_matrix.mean()
+    logger.info(f"Overall stability score: {stability_score:.2f}")
 
-    if labels is not None:
-        # Map the labels to the grid
-        for i, (xi, yi) in enumerate(zip(x, y, strict=False)):
-            ix = np.argmin(np.abs(x_grid - xi))
-            iy = np.argmin(np.abs(y_grid - yi))
-            label_grid[iy, ix] = labels[i]
+    # Check if overall stability is too low
+    if stability_score < overall_threshold:
+        raise ValueError(
+            f"Overall clustering stability ({stability_score:.2f}) is below threshold "
+            f"({overall_threshold}). Results are too unstable across scales."
+        )
 
-    return X, Y, label_grid
+    # Get valid cluster predictions and compute mode
+    valid_preds = all_cluster_preds[valid_scales]
+    logger.info(
+        f"Using {sum(valid_scales)}/{n_scales} scales: sigma={np.array(sigma_values)[valid_scales]}"
+    )
+
+    # Compute mode (most common label at each point)
+    combined_cluster_pred, _ = mode(valid_preds, axis=0)
+    combined_cluster_pred = combined_cluster_pred.flatten()
+
+    # Compute also average posterior probabilities, entropy and assignment uncertainty
+    avg_posterior_probs = np.mean([res["posterior_probs"] for res in results], axis=0)
+    avg_entropy = -np.sum(
+        avg_posterior_probs * np.log(avg_posterior_probs + 1e-10), axis=1
+    )
+
+    # Aggregate results in a dictionary
+    aggregated_results = {
+        "combined_cluster_pred": combined_cluster_pred,
+        "similarity_matrix": similarity_matrix,
+        "stability_score": stability_score,
+        "valid_scales": np.array(sigma_values)[valid_scales].tolist(),
+        "avg_posterior_probs": avg_posterior_probs,
+        "avg_entropy": avg_entropy,
+    }
+
+    return aggregated_results
+
+
+# === GRID data filtering ===
 
 
 def remove_small_grid_components(label_grid, min_size=5, connectivity=8):
@@ -258,72 +338,7 @@ def split_disconnected_components(label_grid, connectivity=8, start_label=0):
     return new_grid, mapping
 
 
-def map_grid_to_points(
-    X,
-    Y,
-    label_grid,
-    x_points,
-    y_points,
-    keep_nan=True,
-    nan_fill=-1,
-):
-    """
-    Map values from a 2D grid (label_grid) back to query points.
-
-    Parameters:
-    -----------
-    X, Y : numpy.ndarray
-        Meshgrid arrays returned by create_2d_grid (X.shape == label_grid.shape)
-    label_grid : numpy.ndarray
-        2D array with labels (np.nan = empty cells)
-    x_points, y_points : numpy.ndarray
-        1D arrays of query point coordinates
-    keep_nan : bool, default=True
-        If True, keep NaN points and fill with nan_fill value
-        If False, filter out NaN points and return filtered coordinates
-    nan_fill : int, default=-1
-        Value to use when grid cell is NaN (only used if keep_nan=True)
-
-    Returns:
-    --------
-        tuple : (labels, x, y)
-            - label: Array of mapped labels (excluding NaN points if keep_nan=False)
-            - x: Array of x coordinates (excluding NaN points if keep_nan=False)
-            - y: Array of y coordinates (excluding NaN points if keep_nan=False)
-    """
-    # Ensure inputs are numpy arrays
-    x_points = np.asarray(x_points)
-    y_points = np.asarray(y_points)
-
-    if len(x_points) != len(y_points):
-        raise ValueError("x_points and y_points must have the same length")
-
-    # Extract grid coordinates
-    x_grid = X[0, :]
-    y_grid = Y[:, 0]
-
-    # Initialize output array
-    n_points = len(x_points)
-    labels = np.full(n_points, nan_fill, dtype=int)
-
-    # Map each point to nearest grid cell
-    for i, (xi, yi) in enumerate(zip(x_points, y_points, strict=False)):
-        # Find nearest grid indices
-        ix = np.argmin(np.abs(x_grid - xi))
-        iy = np.argmin(np.abs(y_grid - yi))
-
-        # Get grid value
-        val = label_grid[iy, ix]
-        labels[i] = nan_fill if np.isnan(val) else int(val)
-
-    if not keep_nan:
-        # Filter out NaN points
-        valid_mask = labels != nan_fill
-        labels = labels[valid_mask]
-        x_points = x_points[valid_mask]
-        y_points = y_points[valid_mask]
-
-    return labels, x_points, y_points
+# === Statistics and visualization ===
 
 
 def compute_cluster_statistics_simple(
