@@ -10,29 +10,31 @@ import pandas as pd
 from sqlalchemy import create_engine
 
 from ppcluster import logger
-from ppcluster.config import ConfigManager
-from ppcluster.database import (
-    get_dic_analysis_by_ids,
-    get_dic_analysis_ids,
-    get_dic_data,
-    get_image,
+from ppcluster.griddata import (
+    create_2d_grid,
+    map_grid_to_points,
 )
 from ppcluster.mcmc import (
     assign_spatial_priors,
     compute_posterior_assignments,
 )
-from ppcluster.preprocessing import (
-    apply_dic_filters,
-)
-from ppcluster.roi import PolygonROISelector
 from ppcluster.mcmc.postproc import (
     close_small_holes,
     compute_cluster_statistics_simple,
-    create_2d_grid,
-    map_grid_to_points,
     plot_1d_velocity_clustering_simple,
     remove_small_grid_components,
     split_disconnected_components,
+)
+from ppcluster.preprocessing import (
+    apply_dic_filters,
+)
+from ppcluster.utils.roi import PolygonROISelector
+from ppcluster.utils.config import ConfigManager
+from ppcluster.utils.database import (
+    get_dic_analysis_by_ids,
+    get_dic_analysis_ids,
+    get_dic_data,
+    get_image,
 )
 
 # Use non-interactive backend for matplotlib
