@@ -1,6 +1,8 @@
 import logging
+from pathlib import Path
 from typing import Any
 
+import arviz as az
 import numpy as np
 import pymc as pm
 from pymc import math as pm_math
@@ -12,6 +14,45 @@ logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
 EPS = 1e-12
 rng = np.random.default_rng(RANDOM_SEED)
+
+
+def sample_model(
+    model: pm.Model,
+    output_dir: Path | None = None,
+    base_name: str | None = None,
+    sigma: float | int | None = None,
+    **kwargs,
+) -> tuple[az.InferenceData, bool]:
+    """
+    Simple wrapper to sample a PyMC model with given kwargs and check convergence.
+    Returns an ArviZ InferenceData object and a convergence flag.
+    """
+
+    with model:
+        logger.info("Starting MCMC sampling...")
+        idata = pm.sample(**kwargs)
+        logger.info("Sampling completed.")
+
+    idata_summary = az.summary(idata, var_names=["mu", "sigma"])
+
+    if np.any(idata_summary["r_hat"] > 1.1) or np.any(idata_summary["ess_bulk"] < 200):
+        convergence_flag = False
+        logger.warning("MCMC chains did not fully converge by r_hat/ess criteria.")
+    else:
+        convergence_flag = True
+
+    if output_dir is not None and base_name is not None:
+        scale_str = f"_scale{sigma}" if sigma is not None else ""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        az.to_netcdf(idata, output_dir / f"{base_name}_posterior{scale_str}.idata.nc")
+        idata_summary.to_csv(
+            output_dir / f"{base_name}_posterior{scale_str}_summary.csv"
+        )
+
+    return idata, convergence_flag
+
+
+""" Mixture models with spatial priors"""
 
 
 def build_marginalized_mixture_model(
@@ -84,7 +125,61 @@ def build_marginalized_mixture_model(
     return model
 
 
-"""Markov-Random Fields"""
+def marginalized_mixture_discrete(
+    data: np.ndarray,
+    prior_probs: np.ndarray,
+    sectors: dict[str, Any],
+) -> pm.Model:
+    """
+    Simple marginalized mixture model with discrete cluster assignments.
+    The discrete assigments require Metropolis sampling (not NUTS) that is not efficient, but it can be used for testing. Prefer the marginalized model if possible.
+    """
+
+    n_features = data.shape[1]
+    n_data = data.shape[0]
+    k = len(sectors)
+    model = pm.Model(
+        coords={"obs": range(n_data), "cluster": range(k), "feature": range(n_features)}
+    )
+    with model:
+        # Cluster means
+        mu = pm.Normal("mu", mu=0, sigma=1, dims=("cluster", "feature"))
+
+        # Cluster standard deviations (diagonal covariance)
+        sigma = pm.HalfNormal("sigma", sigma=1, dims=("cluster", "feature"))
+
+        # Cluster assignments with spatial priors
+        z = pm.Categorical("z", p=prior_probs, dims="obs")
+
+        # Likelihood: each point comes from its assigned cluster
+        observations = pm.Normal(
+            "x_obs", mu=mu[z], sigma=sigma[z], observed=data, dims=("obs", "feature")
+        )
+
+        # Sample from the prior predictive distribution
+        # prior_samples = pm.sample_prior_predictive(100)
+        # fig, ax = plt.subplots(figsize=(8, 4))
+        # az.plot_dist(
+        #     data,
+        #     kind="hist",
+        #     color="C1",
+        #     hist_kwargs={"alpha": 0.6},
+        #     label="observed",
+        # )
+        # az.plot_dist(
+        #     prior_samples.prior_predictive["x_obs"],
+        #     kind="hist",
+        #     hist_kwargs={"alpha": 0.6},
+        #     label="simulated",
+        # )
+        # plt.xticks(rotation=45);
+
+    logger.info("Marginalized mixture model with discrete z created (not sampled).")
+
+    return model
+
+
+"""Markov-Random Fields for spatial smoothing of priors"""
 
 
 def build_knn_graph(x, y, n_neighbors=8, length_scale=None):
@@ -140,8 +235,8 @@ def _mrf_update(prior_probs, q, W, beta):
     return pi
 
 
-def run_mrf_regularization(
-    X_scaled,
+def mrf_regularization(
+    data_scaled,
     idata,
     prior_init,
     x,
@@ -168,55 +263,10 @@ def run_mrf_regularization(
 
     W = build_knn_graph(x, y, n_neighbors=n_neighbors, length_scale=length_scale)
     pi = prior_init.copy()
-    q = _responsibilities(X_scaled, mu, sigma, pi)
+    q = _responsibilities(data_scaled, mu, sigma, pi)
 
     for _ in range(n_iter):
         pi = _mrf_update(pi, q, W, beta)
-        q = _responsibilities(X_scaled, mu, sigma, pi)
+        q = _responsibilities(data_scaled, mu, sigma, pi)
 
     return pi, q
-
-
-def marginalized_mixture_discrete():
-    # # Simple, not marginalized model (z discrete) --> slower sampling, but direct cluster assignments
-
-    # n_features = X_scaled.shape[1]
-    # n_data = X_scaled.shape[0]
-    # k = len(sectors)  # number of clusters = number of sectors
-    #
-    # with pm.Model(
-    #     coords={"cluster": range(k), "feature": range(n_features), "obs": range(ndata)}
-    # ) as simple_model:
-    #     # Cluster means
-    #     μ = pm.Normal("μ", mu=0, sigma=1, dims=("cluster", "feature"))
-
-    #     # Cluster standard deviations (diagonal covariance)
-    #     σ = pm.HalfNormal("σ", sigma=0.5, dims=("cluster", "feature"))
-
-    #     # Cluster assignments with spatial priors
-    #     z = pm.Categorical("z", p=prior_probs, dims="obs")
-
-    #     # Likelihood: each point comes from its assigned cluster
-    #     observations = pm.Normal(
-    #         "x_obs", mu=μ[z], sigma=σ[z], observed=X_scaled, dims=("obs", "feature")
-    #     )
-
-    # with simple_model:
-    #     prior_samples = pm.sample_prior_predictive(100)
-
-    # fig, ax = plt.subplots(figsize=(8, 4))
-    # az.plot_dist(
-    #     X_scaled,
-    #     kind="hist",
-    #     color="C1",
-    #     hist_kwargs={"alpha": 0.6},
-    #     label="observed",
-    # )
-    # az.plot_dist(
-    #     prior_samples.prior_predictive["x_obs"],
-    #     kind="hist",
-    #     hist_kwargs={"alpha": 0.6},
-    #     label="simulated",
-    # )
-    # plt.xticks(rotation=45);
-    pass

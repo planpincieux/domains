@@ -806,3 +806,38 @@ def plot_discontinuities(
 #     dpi=300,
 #     bbox_inches="tight",
 # )
+
+
+if __name__ == "__main__":
+    df = ...  # load your dataframe with x,y,V columns
+    img = ...  # load your background image if available
+    sectors = ...  # optionally define sectors as dict of matplotlib.patches.Polygon
+
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
+    v = df["V"].to_numpy()
+
+    discontinuity_results = find_vertical_discontinuities(
+        x=x,
+        y=y,
+        v=v,
+        vertical_bins=50,
+        horizontal_bins=10,
+        min_points_per_bin_col=20,  # try 5-20 depending on data density
+        gradient_threshold_factor=0.3,  # # Threshold for significant gradient (as fraction of max) adjust to be more/less sensitive
+        smoothing_sigma_1d=1.0,
+        min_strength=1e-3,
+        cluster_eps_factor=2.0,
+        cluster_min_samples=3,
+        border=[500, 500, 1000, 500],  # left, right, bottom, top in px units
+        sectors=sectors,  # optional: use predefined sectors instead of DBSCAN
+    )
+    fig, ax = plt.subplots(figsize=(10, 8))
+    plot_discontinuities(
+        x,
+        y,
+        v,
+        discontinuities=discontinuity_results,
+        img=img,
+        ax=ax,
+    )
