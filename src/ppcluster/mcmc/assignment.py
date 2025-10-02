@@ -556,7 +556,7 @@ def collect_run_metadata(
     """Automatically collect metadata from current variables and context."""
 
     logger.warning(
-        "This function is temporary and it will be replaced by a more structured configuration system."
+        f"Function {collect_run_metadata.__name__} is temporary and it will be replaced by a more structured configuration system."
     )
 
     # Get variables from current namespace/globals

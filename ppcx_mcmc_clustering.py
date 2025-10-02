@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 from matplotlib import colors as mcolors
+from matplotlib import patches as mpatches
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
 from sklearn.metrics import (
@@ -49,6 +50,248 @@ from ppcluster.utils.database import (
 
 matplotlib.use("Agg")  # Use a non-interactive backend
 
+# %%
+## Helper function to preprocess velocity features
+
+
+def run_mcmc_clustering(
+    df_input,
+    prior_probs,
+    sectors,
+    smooth_scale,
+    output_dir,
+    base_name,
+    img=None,
+    variables_names=None,
+    transform_velocity="none",
+    transform_params=None,
+    mu_params=None,
+    sigma_params=None,
+    feature_weights=None,
+    sample_args=None,
+    mrf_regularization: bool = False,
+    mrf_kwargs: dict | None = None,
+    second_pass: str = "full",  # "skip" | "short" | "full"
+    second_pass_sample_args: dict | None = None,
+):
+    """
+    Run MCMC-based clustering on velocity data with flexible velocity transformations.
+
+    Parameters:
+    -----------
+    df_input : pandas.DataFrame
+        Input dataframe with 'x', 'y', 'V' columns
+    transform_velocity : str, default="none"
+        Type of velocity transformation: "power", "exponential", "threshold", "sigmoid", or "none"
+    transform_params : dict, optional
+        Parameters for velocity transformation (see preprocess_velocity_features for details)
+    """
+
+    # --- helper: build initvals from idata posterior means (warm-start) ---
+    def _initvals_from_idata(idata_in, n_chains):
+        mu_mean = idata_in.posterior["mu"].mean(dim=["chain", "draw"]).values
+        sigma_mean = idata_in.posterior["sigma"].mean(dim=["chain", "draw"]).values
+        # Ensure shapes match the model dims; return a list of per-chain dicts
+        init = {"mu": mu_mean, "sigma": sigma_mean}
+        return [init for _ in range(n_chains)]
+
+    logger.info(f"Running MCMC clustering for {base_name}...")
+
+    # Default parameters if not provided
+    if mu_params is None:
+        mu_params = {"mu": 0, "sigma": 1}
+    if sigma_params is None:
+        sigma_params = {"sigma": 1}
+    if sample_args is None:
+        sample_args = dict(
+            target_accept=0.95,
+            draws=2000,
+            tune=1000,
+            chains=4,
+            cores=4,
+        )
+    if variables_names is None:
+        variables_names = ["V"]
+
+    if "V" not in df_input.columns:
+        raise ValueError("Input dataframe must contain 'V' column for velocities.")
+
+    df_run = apply_2d_gaussian_filter(df_input, sigma=smooth_scale)
+
+    # Preprocess velocity features to enhance high velocities
+    velocities, transform_info = preprocess_velocity_features(
+        velocities=df_run["V"].to_numpy(),
+        velocity_transform=transform_velocity,
+        velocity_params=transform_params,
+    )
+    logger.info(f"Velocity transform applied: {transform_info}")
+
+    # Extract data array for clustering
+    if len(variables_names) > 1:
+        # Concatenate other features to velocities
+        additional_vars = variables_names.copy()
+        if "V" in additional_vars:
+            additional_vars.remove("V")
+        additional_data = df_run[additional_vars].to_numpy()
+        data_array = np.column_stack((velocities, additional_data))
+    else:
+        # Use only velocities
+        data_array = velocities.reshape(-1, 1)
+
+    # Scale data for model input
+    scaler = StandardScaler()
+    scaler.fit(data_array)
+    joblib.dump(scaler, output_dir / f"{base_name}_scaler.joblib")
+    data_array_scaled = scaler.transform(data_array)
+
+    # Build model
+    logger.info(f"Running MCMC clustering for {base_name}...")
+    model = mcmc.build_marginalized_mixture_model(
+        data_array_scaled,
+        prior_probs,
+        sectors,
+        mu_params=mu_params,
+        sigma_params=sigma_params,
+        feature_weights=feature_weights,
+    )
+
+    # Sample model (1st pass)
+    idata, convergence_flag = mcmc.sample_model(
+        model, output_dir, base_name, **sample_args
+    )
+    if not convergence_flag:
+        idata_summary = az.summary(idata, var_names=["mu", "sigma"])
+        logger.warning(f"MCMC did not converge. Summary:\n{idata_summary}")
+        logger.warning("Consider increasing draws/tune or adjusting model priors.")
+
+    # Quick trace plot of first pass
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    az.plot_trace(
+        idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
+    )
+    fig.savefig(output_dir / f"{base_name}_first_pass_trace.png", dpi=150)
+    plt.close(fig)
+
+    # --- MRF regularization of priors and optional re-sample ---
+    prior_used = prior_probs
+    if mrf_regularization:
+        x_pos = df_run["x"].to_numpy()
+        y_pos = df_run["y"].to_numpy()
+        mkw = dict(n_neighbors=8, length_scale=50, beta=0.3, n_iter=5)
+        if mrf_kwargs:
+            mkw.update(mrf_kwargs)
+        prior_mrf, q_mrf = mcmc.mrf_regularization(
+            data_array_scaled, idata, prior_probs, x_pos, y_pos, **mkw
+        )
+        prior_used = prior_mrf
+
+        # visualize refined priors
+        try:
+            fig, _ = mcmc.plot_spatial_priors(df_run, prior_mrf, img=img)
+            fig.savefig(
+                output_dir / f"{base_name}_mrf_priors.png", dpi=150, bbox_inches="tight"
+            )
+            # plt.close(fig)
+        except Exception as exc:
+            logger.warning(f"Could not plot MRF priors: {exc}")
+
+    # Decide second pass strategy
+    if mrf_regularization and second_pass.lower() == "skip":
+        # Fastest: don't re-sample. Use q_mrf as final posterior_probs and argmax as labels.
+        posterior_probs = q_mrf
+        cluster_pred = np.argmax(posterior_probs, axis=1)
+        uncertainty = 1.0 - posterior_probs.max(axis=1)
+        # keep idata from 1st pass for plots/params
+    else:
+        # Re-sample with refined priors (short or full)
+        if mrf_regularization:
+            with model:
+                pm.set_data({"prior_w": prior_used})
+
+        # Allow short second pass and warm start
+        sp2_args = dict(**sample_args)
+        if second_pass.lower() == "short":
+            # much fewer draws/tune; fewer chains can also help
+            sp2_args.update(dict(draws=600, tune=400, chains=2, cores=2))
+
+        # Override any args if provided
+        if second_pass_sample_args:
+            sp2_args.update(second_pass_sample_args)
+
+        # Warm-start from previous posterior means
+        initvals = _initvals_from_idata(idata, sp2_args.get("chains", 2))
+        with model:
+            idata, convergence_flag = mcmc.sample_model(
+                model,
+                output_dir,
+                base_name + ("_mrf" if mrf_regularization else ""),
+                initvals=initvals,
+                **sp2_args,
+            )
+
+        # Compute posterior-based assignments
+        posterior_probs, cluster_pred, uncertainty = mcmc.compute_posterior_assignments(
+            idata, n_posterior_samples=200
+        )
+
+    # Generate plots
+    fig = mcmc.plot_velocity_clustering(
+        df_features=df_input,
+        img=img,
+        idata=idata,
+        cluster_pred=cluster_pred,
+        posterior_probs=posterior_probs,
+        scaler=scaler,
+    )
+    fig.savefig(
+        output_dir / f"{base_name}_results.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    # Trace plots
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    az.plot_trace(
+        idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
+    )
+    fig.savefig(output_dir / f"{base_name}_trace_plots.png", dpi=150)
+    plt.close(fig)
+
+    # Forest plots
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    az.plot_forest(idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes)
+    fig.savefig(output_dir / f"{base_name}_forest_plot.png", dpi=150)
+    plt.close(fig)
+
+    # Collect and save metadata
+    metadata = mcmc.collect_run_metadata(
+        idata=idata,
+        convergence_flag=convergence_flag,
+        data_array_scaled=data_array_scaled,
+        variables_names=variables_names,
+        sectors=sectors,
+        prior_probs=prior_probs,
+        sample_args=sample_args,
+        frame=locals(),
+    )
+    mcmc.save_run_metadata(output_dir, base_name, metadata)
+
+    # Return results dictionary
+    result = {
+        "metadata": metadata,
+        "idata": idata,
+        "scaler": scaler,
+        "convergence_flag": convergence_flag,
+        "posterior_probs": posterior_probs,
+        "cluster_pred": cluster_pred,
+        "uncertainty": uncertainty,
+    }
+
+    plt.close("all")
+    return result
+
+
 RANDOM_SEED = None
 
 # Load configuration
@@ -59,16 +302,9 @@ db_engine = create_engine(config.db_url)
 SAVE_OUTPUTS = True  # Set to True to save inference results
 LOAD_EXISTING = False  # Set to False to run sampling again
 
-# MCMC parameters
-DRAWS = 2000  # Number of MCMC draws
-TUNE = 1000  # Number of tuning steps
-CHAINS = 4  # Number of MCMC chains
-CORES = 4  # Number of CPU cores to use
-TARGET_ACCEPT = 0.9  # Target acceptance rate for NUTS sampler
-
 # Data selection parameters
 camera_name = "PPCX_Tele"
-reference_date = "2017-07-08"
+reference_date = "2023-07-18"
 days_before_to_include = 0  # Number of days before reference date to include
 days_after_to_include = 0  # Number of days after reference date to include
 dt_min = 72  # Minimum time difference between images in hours
@@ -184,12 +420,12 @@ for src_id, df_src in out.items():
         # Append processed dataframe to the list
         processed.append(df_src)
     except Exception as exc:
-        logger.warning("Filtering failed for %s: %s", src_id, exc)
+        logger.warning(f"Filtering failed for {src_id}: {exc}")
 if not processed:
     raise RuntimeError("No dataframes left after filtering.")
 # Stack all processed dataframes
 df = pd.concat(processed, ignore_index=True)
-logger.info("Data shape after filtering and stacking: %s", df.shape)
+logger.info(f"Data shape after filtering and stacking: {df.shape}")
 
 # Apply subsampling
 if SUBSAMPLE_FACTOR > 1:
@@ -203,243 +439,6 @@ if SUBSAMPLE_FACTOR > 1:
 # %% [markdown]
 # ## RUN MCMC multiple times with different smoothing scales and median the clustering results
 #
-# %%
-## Helper function to preprocess velocity features
-
-
-def run_mcmc_clustering(
-    df_input,
-    prior_probs,
-    sectors,
-    output_dir,
-    base_name,
-    img=None,
-    variables_names=None,
-    transform_velocity="none",
-    transform_params=None,
-    mu_params=None,
-    sigma_params=None,
-    feature_weights=None,
-    sample_args=None,
-    mrf_regularization: bool = False,
-    mrf_kwargs: dict | None = None,
-    second_pass: str = "full",  # "skip" | "short" | "full"
-    second_pass_sample_args: dict | None = None,
-    random_seed=8927,
-):
-    """
-    Run MCMC-based clustering on velocity data with flexible velocity transformations.
-
-    Parameters:
-    -----------
-    df_input : pandas.DataFrame
-        Input dataframe with 'x', 'y', 'V' columns
-    transform_velocity : str, default="none"
-        Type of velocity transformation: "power", "exponential", "threshold", "sigmoid", or "none"
-    transform_params : dict, optional
-        Parameters for velocity transformation (see preprocess_velocity_features for details)
-    """
-
-    # --- helper: build initvals from idata posterior means (warm-start) ---
-    def _initvals_from_idata(idata_in, n_chains):
-        mu_mean = idata_in.posterior["mu"].mean(dim=["chain", "draw"]).values
-        sigma_mean = idata_in.posterior["sigma"].mean(dim=["chain", "draw"]).values
-        # Ensure shapes match the model dims; return a list of per-chain dicts
-        init = {"mu": mu_mean, "sigma": sigma_mean}
-        return [init for _ in range(n_chains)]
-
-    logger.info(f"Running MCMC clustering for {base_name}...")
-
-    # Default parameters if not provided
-    if mu_params is None:
-        mu_params = {"mu": 0, "sigma": 1}
-    if sigma_params is None:
-        sigma_params = {"sigma": 1}
-    if sample_args is None:
-        sample_args = dict(
-            target_accept=0.95,
-            draws=2000,
-            tune=1000,
-            chains=4,
-            cores=4,
-            random_seed=random_seed,
-        )
-    if variables_names is None:
-        variables_names = ["V"]
-
-    if "V" not in df_input.columns:
-        raise ValueError("Input dataframe must contain 'V' column for velocities.")
-
-    # Preprocess velocity features to enhance high velocities
-    velocities, transform_info = preprocess_velocity_features(
-        velocities=df_input["V"].to_numpy(),
-        velocity_transform=transform_velocity,
-        velocity_params=transform_params,
-    )
-
-    # Extract data array for clustering
-    if len(variables_names) > 1:
-        # Concatenate other features to velocities
-        additional_vars = variables_names.copy()
-        if "V" in additional_vars:
-            additional_vars.remove("V")
-        additional_data = df_input[additional_vars].to_numpy()
-        data_array = np.column_stack((velocities, additional_data))
-    else:
-        # Use only velocities
-        data_array = velocities.reshape(-1, 1)
-
-    # Scale data for model input
-    scaler = StandardScaler()
-    scaler.fit(data_array)
-    joblib.dump(scaler, output_dir / f"{base_name}_scaler.joblib")
-    data_array_scaled = scaler.transform(data_array)
-
-    # Build model
-    logger.info(f"Running MCMC clustering for {base_name}...")
-    model = mcmc.build_marginalized_mixture_model(
-        data_array_scaled,
-        prior_probs,
-        sectors,
-        mu_params=mu_params,
-        sigma_params=sigma_params,
-        feature_weights=feature_weights,
-    )
-
-    # Sample model (1st pass)
-    idata, convergence_flag = mcmc.sample_model(
-        model, output_dir, base_name, **sample_args
-    )
-    if not convergence_flag:
-        idata_summary = az.summary(idata, var_names=["mu", "sigma"])
-        logger.info(f"MCMC did not converge. Summary:\n{idata_summary}")
-
-    # --- MRF regularization of priors and optional re-sample ---
-    prior_used = prior_probs
-    if mrf_regularization:
-        x_pos = df_input["x"].to_numpy()
-        y_pos = df_input["y"].to_numpy()
-        mkw = dict(n_neighbors=8, length_scale=50, beta=0.3, n_iter=5)
-        if mrf_kwargs:
-            mkw.update(mrf_kwargs)
-        prior_mrf, q_mrf = mcmc.mrf_regularization(
-            data_array_scaled, idata, prior_probs, x_pos, y_pos, **mkw
-        )
-        prior_used = prior_mrf
-
-        # visualize refined priors
-        try:
-            fig, _ = mcmc.plot_spatial_priors(df_input, prior_mrf, img=img)
-            fig.savefig(
-                output_dir / f"{base_name}_mrf_priors.png", dpi=150, bbox_inches="tight"
-            )
-            # plt.close(fig)
-        except Exception as exc:
-            logger.warning(f"Could not plot MRF priors: {exc}")
-
-    # Decide second pass strategy
-    if mrf_regularization and second_pass.lower() == "skip":
-        # Fastest: don't re-sample. Use q_mrf as final posterior_probs and argmax as labels.
-        posterior_probs = q_mrf
-        cluster_pred = np.argmax(posterior_probs, axis=1)
-        uncertainty = 1.0 - posterior_probs.max(axis=1)
-        # keep idata from 1st pass for plots/params
-    else:
-        # Re-sample with refined priors (short or full)
-        if mrf_regularization:
-            with model:
-                pm.set_data({"prior_w": prior_used})
-
-        # Allow short second pass and warm start
-        sp2_args = dict(**sample_args)
-        if second_pass.lower() == "short":
-            # much fewer draws/tune; fewer chains can also help
-            sp2_args.update(dict(draws=600, tune=400, chains=2, cores=2))
-            if second_pass_sample_args:
-                sp2_args.update(second_pass_sample_args)
-        elif second_pass_sample_args:
-            sp2_args.update(second_pass_sample_args)
-
-        # Warm-start from previous posterior means
-        initvals = _initvals_from_idata(idata, sp2_args.get("chains", 2))
-
-        with model:
-            # pass initvals through sample_model if it supports, else call pm.sample directly
-            try:
-                idata, convergence_flag = mcmc.sample_model(
-                    model,
-                    output_dir,
-                    base_name + ("_mrf" if mrf_regularization else ""),
-                    initvals=initvals,
-                    **sp2_args,
-                )
-            except TypeError:
-                # fallback if your wrapper doesn't accept initvals
-                idata = pm.sample(**sp2_args)
-                convergence_flag = True
-
-        # Compute posterior-based assignments
-        posterior_probs, cluster_pred, uncertainty = mcmc.compute_posterior_assignments(
-            idata, n_posterior_samples=200
-        )
-
-    # Generate plots
-    fig = mcmc.plot_velocity_clustering(
-        df_features=df_input,
-        img=img,
-        idata=idata,
-        cluster_pred=cluster_pred,
-        posterior_probs=posterior_probs,
-        scaler=scaler,
-    )
-    fig.savefig(
-        output_dir / f"{base_name}_results.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-    # Trace plots
-    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-    az.plot_trace(
-        idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
-    )
-    fig.savefig(output_dir / f"{base_name}_trace_plots.png", dpi=150)
-    plt.close(fig)
-
-    # Forest plots
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    az.plot_forest(idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes)
-    fig.savefig(output_dir / f"{base_name}_forest_plot.png", dpi=150)
-    plt.close(fig)
-
-    # Collect and save metadata
-    metadata = mcmc.collect_run_metadata(
-        idata=idata,
-        convergence_flag=convergence_flag,
-        data_array_scaled=data_array_scaled,
-        variables_names=variables_names,
-        sectors=sectors,
-        prior_probs=prior_probs,
-        sample_args=sample_args,
-        frame=locals(),
-    )
-    mcmc.save_run_metadata(output_dir, base_name, metadata)
-
-    # Return results dictionary
-    result = {
-        "metadata": metadata,
-        "idata": idata,
-        "scaler": scaler,
-        "convergence_flag": convergence_flag,
-        "posterior_probs": posterior_probs,
-        "cluster_pred": cluster_pred,
-        "uncertainty": uncertainty,
-    }
-
-    plt.close("all")
-    return result
-
 
 # %%
 # Assign spatial priors
@@ -475,12 +474,13 @@ q = ax.quiver(
     df["v"].to_numpy(),
     magnitudes,
     scale=None,
-    scale_units="xy",
+    # scale_units="xy",
     angles="xy",
-    cmap="viridis",
+    cmap="magma",
     norm=norm,
-    width=0.008,
-    headwidth=2.5,
+    width=0.005,
+    headwidth=3,
+    minlength=0.5,
     alpha=1.0,
 )
 cbar = fig.colorbar(q, ax=ax, shrink=0.8, aspect=20, pad=0.02)
@@ -489,7 +489,6 @@ ax.set_aspect("equal")
 ax.set_xticks([])
 ax.set_yticks([])
 ax.grid(False)
-
 fig.savefig(
     output_dir / f"{base_name}_velocity_field.jpg",
     dpi=150,
@@ -508,35 +507,51 @@ for sigma in sigma_values:
     scale_base_name = f"{date_start}_{date_end}_sigma{sigma}"
 
     # Apply Gaussian smoothing if needed (skipped for sigma=0)
-    df_run = apply_2d_gaussian_filter(df, sigma=sigma)
+    # df_run = apply_2d_gaussian_filter(df, sigma=sigma)
+    df_run = df.copy()
 
     # Adjust model parameters based on scale
     mu_params = {"mu": 0, "sigma": 1 if sigma <= 2 else 0.5}
     sigma_params = {"sigma": 1 if sigma <= 2 else 0.5}
+
+    # First pass sampling options
+    first_pass_args = dict(
+        target_accept=0.97,  # Target acceptance rate for NUTS sampler
+        draws=2000,  # Number of effective draws
+        tune=1000,  # Number of tuning steps
+        chains=4,  # Number of MCMC chains
+        cores=4,  # Number of CPU cores to use
+    )
+
+    # MRF prior regularization settings
+    mrf_regularization = True
+    mrf_kwargs = dict(n_neighbors=8, length_scale=100, beta=0.3, n_iter=5)
+
+    # Second pass sampling options:
+    # 1) "short": short sampling + warm-start (recommended default):
+    # 2) "skip": fastest, rely only on MRF priors, no re-sampling
+    second_pass = "short"  # "skip" | "short" | "full"
+    second_pass_args = dict(draws=900, tune=100, chains=4, cores=4, target_accept=0.9)
 
     # Run MCMC clustering with the smoothed data
     result = run_mcmc_clustering(
         df_input=df_run,
         prior_probs=prior_probs,
         sectors=sectors,
+        smooth_scale=sigma,
         variables_names=variables_names,
         output_dir=output_dir,
         base_name=scale_base_name,
         img=img,
         # transform_velocity="sigmoid",
         # transform_params={"midpoint_percentile": 70, "steepness": 2.0},
+        sample_args=first_pass_args,
         mu_params=mu_params,
         sigma_params=sigma_params,
-        random_seed=RANDOM_SEED,
-        mrf_regularization=True,
-        mrf_kwargs=dict(n_neighbors=8, length_scale=50, beta=2.0, n_iter=5),
-        # Speed choices:
-        # 1) "short": short sampling + warm-start (recommended default):
-        # 2) "skip": fastest, rely only on MRF priors, no re-sampling
-        second_pass="short",
-        second_pass_sample_args=dict(
-            draws=500, tune=300, chains=4, cores=4, target_accept=0.9
-        ),
+        mrf_regularization=mrf_regularization,
+        mrf_kwargs=mrf_kwargs,
+        second_pass=second_pass,
+        second_pass_sample_args=second_pass_args,
     )
 
     # Add scale information to result
@@ -752,20 +767,20 @@ for label in minor_labels:
             ax, poly, label, colors.get(label, "#888888"), fill_alpha=0.08, zorder=2
         )
 
-handles, labels = ax.get_legend_handles_labels()
-unique_handles = []
-unique_labels = []
-seen = set()
-for handle, name in zip(handles, labels, strict=False):
-    if name in seen:
-        continue
-    seen.add(name)
-    unique_handles.append(handle)
-    unique_labels.append(name)
-if unique_handles:
+
+legend_handles = [
+    mpatches.Patch(
+        facecolor=colors[label],
+        edgecolor=colors[label],
+        alpha=0.35 if label in major_labels else 0.2,
+        label=label,
+    )
+    for label in unique_mk
+]
+if legend_handles:
     ax.legend(
-        unique_handles,
-        unique_labels,
+        legend_handles,
+        [patch.get_label() for patch in legend_handles],
         loc="upper right",
         fontsize=9,
         framealpha=0.9,
@@ -773,8 +788,9 @@ if unique_handles:
 
 ax.set_title("Morpho-Kinematic Sectors")
 ax.set_aspect("equal")
-plt.show()
-
+ax.set_xticks([])
+ax.set_yticks([])
+plt.grid(False)
 fig.savefig(
     output_dir
     / f"{reference_start_date}_{reference_end_date}_mk_sectors_perimeters.png",
