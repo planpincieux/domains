@@ -42,8 +42,8 @@ from ppcluster.preprocessing import (
 )
 from ppcluster.utils.config import ConfigManager
 from ppcluster.utils.database import (
+    fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,
-    get_dic_analysis_ids,
     get_image,
     get_multi_dic_data,
 )
@@ -365,7 +365,7 @@ if not (reference_date or (reference_start_date and reference_end_date)):
     )
 
 # Fetch DIC ids
-dic_ids = get_dic_analysis_ids(
+dic_ids = fetch_dic_analysis_ids(
     db_engine,
     camera_name=camera_name,
     reference_date=reference_date,

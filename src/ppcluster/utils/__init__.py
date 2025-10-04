@@ -1,7 +1,7 @@
 from .config import ConfigManager  # noqa: F401
 from .database import (
+    fetch_dic_analysis_ids,  # noqa: F401
     get_dic_analysis_by_ids,  # noqa: F401
-    get_dic_analysis_ids,  # noqa: F401
     get_dic_data,  # noqa: F401
     get_image,  # noqa: F401
     get_multi_dic_data,  # noqa: F401

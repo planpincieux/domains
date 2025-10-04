@@ -7,9 +7,11 @@ import requests
 from PIL import Image
 from sqlalchemy import create_engine, text
 
-from ppcluster.utils.config import ConfigManager
+from .config import ConfigManager
 
 logger = logging.getLogger("ppcx")
+
+# === helpers ===
 
 
 def _resolve_api_host_port(
@@ -45,7 +47,10 @@ def _resolve_api_host_port(
     return str(host), str(port)
 
 
-def get_dic_analysis_ids(
+# === DIC ===
+
+
+def fetch_dic_analysis_ids(
     db_engine,
     *,
     reference_date: str | datetime | None = None,
@@ -96,10 +101,10 @@ def get_dic_analysis_ids(
         List of DIC analysis IDs matching the specified filters.
 
     Example usage:
-        get_dic_analysis_ids(db_engine, reference_date="2024-08-23", camera_name="PPCX_Tele")
-        get_dic_analysis_ids(db_engine, master_timestamp_start="2024-08-01", master_timestamp_end="2024-08-31")
-        get_dic_analysis_ids(db_engine, time_difference_min=1, time_difference_max=24)
-        get_dic_analysis_ids(db_engine, month=8)
+        fetch_dic_analysis_ids(db_engine, reference_date="2024-08-23", camera_name="PPCX_Tele")
+        fetch_dic_analysis_ids(db_engine, master_timestamp_start="2024-08-01", master_timestamp_end="2024-08-31")
+        fetch_dic_analysis_ids(db_engine, time_difference_min=1, time_difference_max=24)
+        fetch_dic_analysis_ids(db_engine, month=8)
     """
     query = """
     SELECT 
@@ -310,6 +315,80 @@ def get_multi_dic_data(
         return df_stack
     else:
         return df_dic
+
+
+# === Images ===
+
+
+def fetch_image_ids(
+    db_engine,
+    date: str | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    time_of_day: str | None = None,
+    time_start: str | None = None,
+    time_end: str | None = None,
+    limit: int | None = None,
+    order_by: str | None = None,
+) -> list[int]:
+    """Fetch image IDs from the database based on acquisition date and time criteria."""
+
+    query = """
+    SELECT id
+    FROM ppcx_app_image
+    WHERE 1=1
+    """
+
+    if date:
+        query += f" AND acquisition_timestamp::date = '{date}'"
+    if date_start:
+        query += f" AND acquisition_timestamp::date >= '{date_start}'"
+    if date_end:
+        query += f" AND acquisition_timestamp::date <= '{date_end}'"
+    if time_of_day:
+        query += f" AND to_char(acquisition_timestamp, 'HH24:MI:SS') = '{time_of_day}'"
+    if time_start:
+        query += f" AND to_char(acquisition_timestamp, 'HH24:MI:SS') >= '{time_start}'"
+    if time_end:
+        query += f" AND to_char(acquisition_timestamp, 'HH24:MI:SS') <= '{time_end}'"
+    if order_by:
+        query += f" ORDER BY {order_by}"
+    if limit:
+        query += f" LIMIT {limit}"
+
+    with db_engine.connect() as conn:
+        result = conn.execute(text(query))
+        rows = result.fetchall()
+
+    if not rows:
+        raise ValueError("No images found matching the criteria.")
+
+    else:
+        rows = [row[0] for row in rows]
+
+    return rows
+
+
+def fetch_image_metadata_by_ids(
+    db_engine,
+    image_id: list[int] | int,
+) -> pd.DataFrame:
+    """Fetch image metadata from the database based on image ID."""
+
+    if isinstance(image_id, int):
+        image_id = [image_id]
+    params = [tuple(image_id)]
+    query = """
+    SELECT *
+    FROM ppcx_app_image
+    WHERE id IN %s
+    """
+    df = pd.read_sql(query, db_engine, params=tuple(params))
+
+    if df.empty:
+        raise (ValueError("No metadata found for the given image ID."))
+
+    return df
 
 
 def get_image(

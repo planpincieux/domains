@@ -30,8 +30,8 @@ from ppcluster.preprocessing import (
 )
 from ppcluster.utils.config import ConfigManager
 from ppcluster.utils.database import (
+    fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,
-    get_dic_analysis_ids,
     get_dic_data,
     get_image,
 )
@@ -78,7 +78,7 @@ SPLIT_DISCONNECTED_CLUSTERS = False
 
 def process_date(date):
     # Get DIC data
-    dic_ids = get_dic_analysis_ids(
+    dic_ids = fetch_dic_analysis_ids(
         db_engine, camera_name=camera_name, reference_date=date
     )
     if len(dic_ids) == 0:
