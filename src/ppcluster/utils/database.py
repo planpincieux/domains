@@ -65,8 +65,8 @@ def fetch_dic_analysis_ids(
     camera_id: int | None = None,
     camera_name: str | None = None,
     dt_hours: int | None = None,
-    time_difference_min: int | None = None,
-    time_difference_max: int | None = None,
+    dt_hours_min: int | None = None,
+    dt_hours_max: int | None = None,
     month: int | None = None,
 ) -> list[int]:
     """
@@ -93,8 +93,8 @@ def fetch_dic_analysis_ids(
         camera_id: Camera ID
         camera_name: Camera name
         dt_hours: Exact time difference between images (hours)
-        time_difference_min: Minimum time difference (hours)
-        time_difference_max: Maximum time difference (hours)
+        dt_hours_min: Minimum time difference (hours)
+        dt_hours_max: Maximum time difference (hours)
         month: Month (integer, 1-12) for reference_date
 
     Returns:
@@ -103,7 +103,7 @@ def fetch_dic_analysis_ids(
     Example usage:
         fetch_dic_analysis_ids(db_engine, reference_date="2024-08-23", camera_name="PPCX_Tele")
         fetch_dic_analysis_ids(db_engine, master_timestamp_start="2024-08-01", master_timestamp_end="2024-08-31")
-        fetch_dic_analysis_ids(db_engine, time_difference_min=1, time_difference_max=24)
+        fetch_dic_analysis_ids(db_engine, dt_hours_min=1, dt_hours_max=24)
         fetch_dic_analysis_ids(db_engine, month=8)
     """
     query = """
@@ -163,12 +163,12 @@ def fetch_dic_analysis_ids(
     if dt_hours is not None:
         query += " AND DIC.dt_hours = %s"
         params.append(dt_hours)
-    if time_difference_min is not None:
+    if dt_hours_min is not None:
         query += " AND DIC.dt_hours >= %s"
-        params.append(time_difference_min)
-    if time_difference_max is not None:
+        params.append(dt_hours_min)
+    if dt_hours_max is not None:
         query += " AND DIC.dt_hours <= %s"
-        params.append(time_difference_max)
+        params.append(dt_hours_max)
 
     # Month filter (on reference_date)
     if month is not None:

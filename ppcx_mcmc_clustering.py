@@ -371,8 +371,8 @@ dic_ids = fetch_dic_analysis_ids(
     reference_date=reference_date,
     reference_date_start=reference_start_date,
     reference_date_end=reference_end_date,
-    time_difference_min=dt_min,
-    time_difference_max=dt_max,
+    dt_hours_min=dt_min,
+    dt_hours_max=dt_max,
 )
 if len(dic_ids) < 1:
     raise ValueError("No DIC analyses found for the given criteria")
