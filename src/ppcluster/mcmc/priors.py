@@ -82,6 +82,13 @@ def _apply_distance_fade_per_cluster(
     method_kws: dict | None = None,
 ) -> np.ndarray:
     """Apply distance-based fading to all cluster probabilities within a sector."""
+
+    available_methods = ("idw", "linear", "exponential")
+    if method not in available_methods:
+        raise ValueError(
+            f"Unknown fading method: {method}. Available methods: {available_methods}"
+        )
+
     if method_kws is None:
         method_kws = {}
 
@@ -94,15 +101,17 @@ def _apply_distance_fade_per_cluster(
 
     if method == "idw":
         power = method_kws.get("power", 2.0)
-        eps = method_kws.get("eps", 1e-6)
+        eps = 1e-6
         weights = 1.0 / (distances + eps) ** power
 
     elif method == "linear":
-        max_dist = distances.max() if len(distances) > 0 else 1.0
+        max_dist = method_kws.get("max_distance")
+        if max_dist is not None:
+            max_dist = distances.max() if len(distances) > 0 else 1.0
         weights = 1.0 - (distances / max_dist)
 
     elif method == "exponential":
-        decay_rate = method_kws.get("decay_rate", 1.0)
+        decay_rate = method_kws.get("decay_rate", 0.001)
         weights = np.exp(-decay_rate * distances)
 
     else:
@@ -134,10 +143,11 @@ def assign_spatial_priors(
     polygons: dict[str, Any],
     prior_probs: dict[str, list[float]],
     *,
-    method: str = "constant",
-    method_kws: dict | None = None,
+    fade_method: str = "constant",
+    fade_options: dict | None = None,
 ) -> np.ndarray:
     """Assign spatial prior probabilities to each point."""
+
     if len(x) != len(y):
         raise ValueError("x and y must have the same length.")
 
@@ -152,7 +162,7 @@ def assign_spatial_priors(
     uniform = np.ones(n_sectors, dtype=float) / n_sectors
     prior_probs_arr = np.tile(uniform, (ndata, 1))
 
-    if method == "constant":
+    if fade_method == "constant":
         # Original binary assignment
         for name, polygon in polygons.items():
             mask = _polygon_contains_mask(polygon, pts, x, y)
@@ -174,8 +184,8 @@ def assign_spatial_priors(
                     mask,
                     centroid,
                     sector_prior_vec,
-                    method=method,
-                    method_kws=method_kws,
+                    method=fade_method,
+                    method_kws=fade_options,
                 )
 
     # Ensure rows sum to 1

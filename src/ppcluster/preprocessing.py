@@ -302,8 +302,9 @@ def spatial_subsample(df, n_subsample=5, method="regular", random_state=RANDOM_S
 
     Parameters:
     - n_subsample: Take every nth point (for regular) or fraction (for random)
-    - method: 'regular', 'random', or 'stratified'
+    - method: 'regular', 'random''
     """
+    available_methods = ["regular", "random"]
     if method == "regular":
         # Take every nth point in spatial order
         df_sorted = df.sort_values(["x", "y"]).reset_index(drop=True)
@@ -320,7 +321,9 @@ def spatial_subsample(df, n_subsample=5, method="regular", random_state=RANDOM_S
         df_sub = df.sample(n=min(n_samples, len(df)), random_state=random_state).copy()
 
     else:
-        raise ValueError(f"Unknown subsampling method: {method}")
+        raise ValueError(
+            f"Unknown subsampling method: {method}. Available: {available_methods}"
+        )
 
     print(
         f"Subsampled from {len(df)} to {len(df_sub)} points ({len(df_sub) / len(df) * 100:.1f}%)"

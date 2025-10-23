@@ -11,43 +11,97 @@ api:
   port: 8080
   image_view: "images"
 
+# Random seed for reproducibility
+random_seed: 8927
+
 # Data selection parameters
 data:
-  target_date: "2024-09-02"
-  camera_names: ["PPCX_Tele"]
-  roi_path: "data/PPCX_Tele_glacier_ROI.json"
-  sector_prior_pattern: "data/sectors_prior/PPCX_Tele*.json"
+  camera_name: "PPCX_Tele"
+  reference_date: "2017-07-08"
+  days_before_to_include: 0
+  days_after_to_include: 0
+  dt_min: 72  # Minimum time difference between images in hours
+  dt_max: 96  # Maximum time difference between images in hours
+  roi_path: "data/roi.xml"
+  sector_prior_file: "data/priors_4_sectors.xml"
+  variables_names: ["V"] # List of variable names to process
+  output_dir: "output"
 
-# DIC data processing parameters
-dic:
-  # Percentile-based filtering
-  filter_outliers: true
-  tails_percentile: 0.01  # Percentile for outlier filtering (0.01 = 1% tails)
-  
-  # Minimum velocity filtering
-  min_velocity: 1  # use -1 to disable
-  
-  # 2D median filter parameters
-  apply_2d_median: true
-  median_window_size: 5  # Size of median filter window (odd number recommended)
-  median_threshold_factor: 3.0  # Factor for outlier detection (n * median_deviation)
+# Data preprocessing parameters
+preprocessing:
+  subsample_factor: 1
+  subsample_method: "regular"  # or 'random'
+  filter_kwargs:
+    filter_outliers: false
+    tails_percentile: 0.005
+    min_velocity: 0.5
+    apply_2d_median: false
+    median_window_size: 5
+    median_threshold_factor: 3
+    apply_2d_gaussian: false
+    gaussian_sigma: 1.0
 
-# GMM clustering parameters
-clustering:
-  variables_names: ["V"] # ["x", "y", "magnitude", "prior_class"] # "angle_rad" , "angle_deg"
-  n_components: 8
-  weight_concentration_prior: 0.5
-  max_iter: 100
-  random_state: 42
-  covariance_type: "full"
+# Prior probability for each sector
+priors: 
+  probability:
+    A: [1.0, 0.0, 0.0, 0.0]
+    B: [0.1, 0.7, 0.2, 0.0]
+    C: [0.0, 0.2, 0.8, 0.0]
+    D: [0.0, 0.0, 0.3, 0.7]
+  fade_method: "exponential"  # "constant" | "idw" | "linear" | "exponential"
+  fade_options: 
+    idw:
+      power: 2
+    linear:
+      max_distance: 100
+    exponential:
+      "decay_rate": 0.001
 
-# Output configuration
-output:
-  base_dir: "output"
-  save_plots: true
-  plot_dpi: 300
+# MCMC parameters
+mcmc:
+  sample_options:
+    target_accept: 0.9
+    draws: 2000
+    tune: 1000
+    chains: 4
+    cores: 4
+  model_options:
+    mu_params:
+      mu: 0
+      sigma: 1
+    sigma_params:
+      sigma: 1
+  velocity_transform: null  # "power" | "exponential" | "sigmoid" | null
+  transform_params: {} # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
+  mrf_regularization: true
+  mrf_kwargs:
+    n_neighbors: 8
+    length_scale: 50
+    beta: 2.0
+    n_iter: 5
+  # Second pass speed choices:
+    # 1) "short": short sampling + warm-start (recommended default):
+    # 2) "skip": fastest, rely only on MRF priors, no re-sampling
+  second_pass: "short"  # "skip" | "short" | "full"
+  second_pass_sample_args:
+    draws: 500
+    tune: 300
+    chains: 4
+    cores: 4
+    target_accept: 0.9
 
-# Parallel processing parameters
-processing:
-  n_jobs: 1  # Number of parallel jobs
-  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+# Multi-scale processing parameters
+multiscale:
+  sigma_values: [2]
+  aggregation:
+    similarity_threshold: 0.7
+    overall_threshold: 0.8
+
+# Morpho-kinematic analysis parameters
+morphokinematic:
+  minor_overlap_threshold: 0.9
+  base_colors:
+    A: "#b3140b"
+    B: "#ee9c21"
+    C: "#f1ee30"
+    D: "#5fb61c"

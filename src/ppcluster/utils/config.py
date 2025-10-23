@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import Any, Optional
 from omegaconf import DictConfig, OmegaConf
 
 CONFIG_PATH = Path.cwd() / "config.yaml"
+logger = logging.getLogger("ppcx")
 
 
 @dataclass
@@ -74,6 +76,11 @@ class ConfigManager:
     def set(self, key: str, value: Any) -> None:
         """Set a configuration value by dot notation key."""
         OmegaConf.update(self.config, key, value)
+
+    def reload(self) -> None:
+        """Reload the configuration file from disk."""
+        self._config = self._load_config(self.config_path)
+        logger.info(f"Configuration reloaded from {self.config_path}")
 
     @property
     def db_url(self) -> str:
