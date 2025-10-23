@@ -17,7 +17,7 @@ random_seed: 8927
 # Data selection parameters
 data:
   camera_name: "PPCX_Tele"
-  reference_date: "2017-07-08"
+  reference_date: "2017-07-09"
   days_before_to_include: 0
   days_after_to_include: 0
   dt_min: 72  # Minimum time difference between images in hours

@@ -1,4 +1,5 @@
 # %% # ===  IMPORTS  === #
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,11 @@ from ppcluster.utils.database import (
     get_image,
     get_multi_dic_data,
 )
+
+INTERACTIVE = False  # set to True when running in an interactive environment
+
+if not INTERACTIVE:
+    plt.switch_backend("Agg")
 
 
 def run_mcmc_clustering(
@@ -282,527 +288,552 @@ def run_mcmc_clustering(
     return result
 
 
-# %% # ===  LOAD CONFIGURATION  === #
+def main(reference_date: str | None = None):
+    """
+    Run the pipeline. When called interactively you can pass:
+      - reference_date: "YYYY-MM-DD" to override config.data.reference_date
+      - overrides: dict of dot.notation keys -> values to override config entries
+    """  # %% # ===  LOAD CONFIGURATION  === #
 
-# Load configuration and extract parameters from config file
-config = ConfigManager()
-db_engine = create_engine(config.db_url)
-random_seed = config.get("random_seed", 8927)
-rng = np.random.default_rng(random_seed)
+    # %% # ===  CONFIG MANAGER  === #
+    config = ConfigManager()
 
-# %% # ===  DATA LOADING AND PREPROCESSING  === #
+    # Apply CLI overrides to
+    if reference_date:
+        config.set("data.reference_date", reference_date)
 
-data_config = config.get("data", {})
+    # Retrieve reference date
+    reference_date = config.get("data.reference_date", None)
+    if reference_date is None:
+        raise ValueError("reference_date must be specified either via CLI or config.")
 
-# Output base directory (output will be saved in a subfolder with camera name and date range)
-output_base_dir = Path(data_config.get("output_dir", "output"))
+    db_engine = create_engine(config.db_url)
+    random_seed = config.get("random_seed", 8927)
 
-# Data selection parameters
-camera_name = data_config.get("camera_name", "PPCX_Tele")
+    # %% # ===  DATA LOADING AND PREPROCESSING  === #
+    data_config = config.get("data", {})
 
-reference_date = data_config.get("reference_date", "2017-07-08")
-days_before_to_include = data_config.get("days_before_to_include", 0)
-days_after_to_include = data_config.get("days_after_to_include", 0)
-dt_min = data_config.get("dt_min", 72)
-dt_max = data_config.get("dt_max", 96)
-reference_start_date = datetime.strptime(reference_date, "%Y-%m-%d") - pd.Timedelta(
-    days=days_before_to_include
-)
-reference_end_date = datetime.strptime(reference_date, "%Y-%m-%d") + pd.Timedelta(
-    days=days_after_to_include
-)
-variables_names = data_config.get("variables_names", ["V"])
+    # Output base directory (output will be saved in a subfolder with camera name and date range)
+    output_base_dir = Path(data_config.get("output_dir", "output"))
 
-# Read roi and spatial priors
-roi_path = Path(data_config.get("roi_path", "data/roi.xml"))
-sector_prior_file = Path(
-    data_config.get("sector_prior_file", "data/priors_4_sectors.xml")
-)
-roi = read_polygons_from_cvat(roi_path, image_name=None)
-sectors = read_polygons_from_cvat(sector_prior_file, image_name=None)
+    # Data selection parameters
+    camera_name = data_config.get("camera_name", "PPCX_Tele")
+    days_before_to_include = data_config.get("days_before_to_include", 0)
+    days_after_to_include = data_config.get("days_after_to_include", 0)
+    dt_min = data_config.get("dt_min", 72)
+    dt_max = data_config.get("dt_max", 96)
+    reference_start_date = datetime.strptime(reference_date, "%Y-%m-%d") - pd.Timedelta(
+        days=days_before_to_include
+    )
+    reference_end_date = datetime.strptime(reference_date, "%Y-%m-%d") + pd.Timedelta(
+        days=days_after_to_include
+    )
+    variables_names = data_config.get("variables_names", ["V"])
 
-# Check that at least the reference date or an interval of dates is provided
-if not (reference_date or (reference_start_date and reference_end_date)):
-    raise ValueError(
-        "Either reference_date or both reference_start_date and reference_end_date must be provided."
+    # Read roi and spatial priors
+    roi_path = Path(data_config.get("roi_path", "data/roi.xml"))
+    sector_prior_file = Path(
+        data_config.get("sector_prior_file", "data/priors_4_sectors.xml")
+    )
+    roi = read_polygons_from_cvat(roi_path, image_name=None)
+    sectors = read_polygons_from_cvat(sector_prior_file, image_name=None)
+
+    # Check that at least the reference date or an interval of dates is provided
+    if not (reference_date or (reference_start_date and reference_end_date)):
+        raise ValueError(
+            "Either reference_date or both reference_start_date and reference_end_date must be provided."
+        )
+
+    # Fetch DIC ids
+    dic_ids = fetch_dic_analysis_ids(
+        db_engine,
+        camera_name=camera_name,
+        reference_date=reference_date,
+        reference_date_start=reference_start_date,
+        reference_date_end=reference_end_date,
+        dt_hours_min=dt_min,
+        dt_hours_max=dt_max,
+    )
+    if len(dic_ids) < 1:
+        raise ValueError("No DIC analyses found for the given criteria")
+
+    # Get DIC analysis metadata
+    dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
+    logger.info("Fetched DIC analysis:")
+    for _, row in dic_analyses.iterrows():
+        print(
+            f"DIC ID: {row['dic_id']}, date: {row['reference_date']}, dt (hrs): {row['dt_hours']}, Master: {row['master_timestamp']}, Slave: {row['slave_timestamp']}"
+        )
+    print("Summary of selected DIC analyses:")
+    print(dic_analyses.describe())
+
+    # Output paths
+    date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
+    date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
+    output_dir = output_base_dir / f"{camera_name}_{date_end}_mcmc_multiscale"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_name = f"{date_start}_{date_end}"
+
+    # Get master image
+    master_image_id = dic_analyses["master_image_id"].iloc[0]
+    img = get_image(image_id=master_image_id, config=config)
+
+    # Fetch DIC data
+    out = get_multi_dic_data(dic_ids, stack_results=False, config=config)
+    logger.info(f"Found stack of {len(out)} DIC dataframes.")
+
+    # Apply filter for each df in the dictionary and then stack them
+    preprocessing_config = config.get("preprocessing", {})
+    subsample_factor = preprocessing_config.get("subsample_factor", 1)
+    subsample_method = preprocessing_config.get("subsample_method", "random")
+    filter_kwargs = preprocessing_config.get("filter_kwargs", {})
+
+    processed = []
+    for src_id, df_src in out.items():
+        try:
+            # Filter only points inside the spatial priors sectors
+            df_src = filter_dataframe_by_polygons(df_src, polygons=roi)
+
+            # Apply other DIC filters if any
+            df_src = apply_dic_filters(df_src, **filter_kwargs)
+
+            # Append processed dataframe to the list
+            processed.append(df_src)
+        except Exception as exc:
+            logger.warning("Filtering failed for %s: %s", src_id, exc)
+    if not processed:
+        raise RuntimeError("No dataframes left after filtering.")
+
+    # Stack all processed dataframes
+    df = pd.concat(processed, ignore_index=True)
+    logger.info("Data shape after filtering and stacking: %s", df.shape)
+
+    # Apply subsampling
+    if subsample_factor > 1:
+        df_subsampled = spatial_subsample(
+            df, n_subsample=subsample_factor, method=subsample_method
+        )
+        df = df_subsampled
+        logger.info(f"Data shape after subsampling: {df.shape}")
+
+    # %% # ===  SPATIAL PRIORS AND INITIAL VISUALIZATIONS  === #
+
+    # Assign spatial priors
+    prior_config = config.get("priors", {})
+    prior_probability = prior_config.get("probability", None)
+    if not prior_probability:
+        # Default: uniform priors across sectors
+        n_sectors = len(sectors)
+        uniform_prob = 1.0 / n_sectors
+        prior_probability = {name: [uniform_prob] * n_sectors for name in sectors}
+    fade_method = prior_config.get("fade_method", "constant")
+    fade_method_options = prior_config.get("fade_options", {}).get(fade_method, {})
+    prior_probs_array = mcmc.assign_spatial_priors(
+        x=df["x"].to_numpy(),
+        y=df["y"].to_numpy(),
+        polygons=sectors,
+        prior_probs=prior_probability,
+        fade_method=fade_method,
+        fade_options=fade_method_options,
     )
 
-# Fetch DIC ids
-dic_ids = fetch_dic_analysis_ids(
-    db_engine,
-    camera_name=camera_name,
-    reference_date=reference_date,
-    reference_date_start=reference_start_date,
-    reference_date_end=reference_end_date,
-    dt_hours_min=dt_min,
-    dt_hours_max=dt_max,
-)
-if len(dic_ids) < 1:
-    raise ValueError("No DIC analyses found for the given criteria")
-
-# Get DIC analysis metadata
-dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
-logger.info("Fetched DIC analysis:")
-for _, row in dic_analyses.iterrows():
-    print(
-        f"DIC ID: {row['dic_id']}, date: {row['reference_date']}, dt (hrs): {row['dt_hours']}, Master: {row['master_timestamp']}, Slave: {row['slave_timestamp']}"
+    fig, axes = mcmc.plot_spatial_priors(df, prior_probs_array, img=img)
+    fig.savefig(
+        output_dir / f"{base_name}_spatial_priors.jpg", dpi=150, bbox_inches="tight"
     )
-print("Summary of selected DIC analyses:")
-print(dic_analyses.describe())
+    plt.close(fig)
 
-# Output paths
-date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
-date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
-output_dir = output_base_dir / f"{camera_name}_{date_end}_mcmc_multiscale"
-output_dir.mkdir(parents=True, exist_ok=True)
-base_name = f"{date_start}_{date_end}"
-
-# Get master image
-master_image_id = dic_analyses["master_image_id"].iloc[0]
-img = get_image(image_id=master_image_id, config=config)
-
-# Fetch DIC data
-out = get_multi_dic_data(dic_ids, stack_results=False, config=config)
-logger.info(f"Found stack of {len(out)} DIC dataframes.")
-
-# Apply filter for each df in the dictionary and then stack them
-preprocessing_config = config.get("preprocessing", {})
-subsample_factor = preprocessing_config.get("subsample_factor", 1)
-subsample_method = preprocessing_config.get("subsample_method", "random")
-filter_kwargs = preprocessing_config.get("filter_kwargs", {})
-
-processed = []
-for src_id, df_src in out.items():
-    try:
-        # Filter only points inside the spatial priors sectors
-        df_src = filter_dataframe_by_polygons(df_src, polygons=roi)
-
-        # Apply other DIC filters if any
-        df_src = apply_dic_filters(df_src, **filter_kwargs)
-
-        # Append processed dataframe to the list
-        processed.append(df_src)
-    except Exception as exc:
-        logger.warning("Filtering failed for %s: %s", src_id, exc)
-if not processed:
-    raise RuntimeError("No dataframes left after filtering.")
-
-# Stack all processed dataframes
-df = pd.concat(processed, ignore_index=True)
-logger.info("Data shape after filtering and stacking: %s", df.shape)
-
-# Apply subsampling
-if subsample_factor > 1:
-    df_subsampled = spatial_subsample(
-        df, n_subsample=subsample_factor, method=subsample_method
+    # Plot velocity field
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.set_title("Velocity Field", fontsize=14, pad=10)
+    ax.imshow(img, alpha=0.5, cmap="gray")
+    magnitudes = df["V"].to_numpy()
+    vmin = 0.0
+    vmax = np.max(magnitudes)
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    q = ax.quiver(
+        df["x"].to_numpy(),
+        df["y"].to_numpy(),
+        df["u"].to_numpy(),
+        df["v"].to_numpy(),
+        magnitudes,
+        scale=None,
+        scale_units="xy",
+        angles="xy",
+        cmap="viridis",
+        norm=norm,
+        width=0.008,
+        headwidth=2.5,
+        alpha=1.0,
     )
-    df = df_subsampled
-    logger.info(f"Data shape after subsampling: {df.shape}")
+    cbar = fig.colorbar(q, ax=ax, shrink=0.8, aspect=20, pad=0.02)
+    cbar.set_label("Velocity Magnitude", rotation=270, labelpad=15)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
 
+    fig.savefig(
+        output_dir / f"{base_name}_velocity_field.jpg",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
 
-# %% # ===  SPATIAL PRIORS AND INITIAL VISUALIZATIONS  === #
+    # %% # ===  RUN MCMC CLUSTERING  === #
 
-# Assign spatial priors
-prior_config = config.get("priors", {})
-prior_probability = prior_config.get("probability", None)
-if not prior_probability:
-    # Default: uniform priors across sectors
-    n_sectors = len(sectors)
-    uniform_prob = 1.0 / n_sectors
-    prior_probability = {name: [uniform_prob] * n_sectors for name in sectors}
-fade_method = prior_config.get("fade_method", "constant")
-fade_method_options = prior_config.get("fade_options", {}).get(fade_method, {})
-prior_probs_array = mcmc.assign_spatial_priors(
-    x=df["x"].to_numpy(),
-    y=df["y"].to_numpy(),
-    polygons=sectors,
-    prior_probs=prior_probability,
-    fade_method=fade_method,
-    fade_options=fade_method_options,
-)
+    # MCMC parameters
+    mcmc_config = config.get("mcmc", {})
+    sample_options = mcmc_config.get("sample_options", {})
+    sample_args = {
+        "draws": sample_options.get("draws", 2000),
+        "tune": sample_options.get("tune", 1000),
+        "chains": sample_options.get("chains", 4),
+        "cores": sample_options.get("cores", 4),
+        "target_accept": sample_options.get("target_accept", 0.9),
+        "random_seed": random_seed,
+    }
+    model_options = mcmc_config.get("model_options", {})
+    mu_params = model_options.get("mu_params", {"mu": 0, "sigma": 1})
+    sigma_params = model_options.get("sigma_params", {"sigma": 1})
 
-fig, axes = mcmc.plot_spatial_priors(df, prior_probs_array, img=img)
-fig.savefig(
-    output_dir / f"{base_name}_spatial_priors.jpg", dpi=150, bbox_inches="tight"
-)
-plt.close(fig)
+    # Velocity transformation parameters
+    velocity_transform = mcmc_config.get(
+        "velocity_transform", None
+    )  # also: "power", "exponential", "sigmoid"
+    transform_params = mcmc_config.get(
+        "transform_params", {}
+    )  # also {"midpoint_percentile": 70, "steepness": 2.0},)
 
-# Plot velocity field
-fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-ax.set_title("Velocity Field", fontsize=14, pad=10)
-ax.imshow(img, alpha=0.5, cmap="gray")
-magnitudes = df["V"].to_numpy()
-vmin = 0.0
-vmax = np.max(magnitudes)
-norm = Normalize(vmin=vmin, vmax=vmax)
-q = ax.quiver(
-    df["x"].to_numpy(),
-    df["y"].to_numpy(),
-    df["u"].to_numpy(),
-    df["v"].to_numpy(),
-    magnitudes,
-    scale=None,
-    scale_units="xy",
-    angles="xy",
-    cmap="viridis",
-    norm=norm,
-    width=0.008,
-    headwidth=2.5,
-    alpha=1.0,
-)
-cbar = fig.colorbar(q, ax=ax, shrink=0.8, aspect=20, pad=0.02)
-cbar.set_label("Velocity Magnitude", rotation=270, labelpad=15)
-ax.set_aspect("equal")
-ax.set_xticks([])
-ax.set_yticks([])
-ax.grid(False)
+    # MRF regularization parameters
+    mrf_regularization = mcmc_config.get("mrf_regularization", True)
+    mrf_kwargs = mcmc_config.get("mrf_kwargs", {})
+    second_pass = mcmc_config.get("second_pass", "short")
+    second_pass_sample_args = mcmc_config.get("second_pass_sample_args", {})
 
-fig.savefig(
-    output_dir / f"{base_name}_velocity_field.jpg",
-    dpi=150,
-    bbox_inches="tight",
-)
-plt.close(fig)
+    # Multiscale parameters
+    multiscale_config = config.get("multiscale", {})
+    sigma_values = multiscale_config.get("sigma_values", [2])
 
-# %% # ===  RUN MCMC CLUSTERING  === #
+    # Aggregation parameters
+    aggregation_config = multiscale_config.get("aggregation", {})
+    similarity_threshold = aggregation_config.get("similarity_threshold", 0.7)
+    overall_threshold = aggregation_config.get("overall_threshold", 0.8)
 
-# MCMC parameters
-mcmc_config = config.get("mcmc", {})
-sample_options = mcmc_config.get("sample_options", {})
-sample_args = {
-    "draws": sample_options.get("draws", 2000),
-    "tune": sample_options.get("tune", 1000),
-    "chains": sample_options.get("chains", 4),
-    "cores": sample_options.get("cores", 4),
-    "target_accept": sample_options.get("target_accept", 0.9),
-    "random_seed": random_seed,
-}
-model_options = mcmc_config.get("model_options", {})
-mu_params = model_options.get("mu_params", {"mu": 0, "sigma": 1})
-sigma_params = model_options.get("sigma_params", {"sigma": 1})
+    # Loop through smoothing scales
+    results = []
+    for sigma in sigma_values:
+        logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
 
-# Velocity transformation parameters
-velocity_transform = mcmc_config.get(
-    "velocity_transform", None
-)  # also: "power", "exponential", "sigmoid"
-transform_params = mcmc_config.get(
-    "transform_params", {}
-)  # also {"midpoint_percentile": 70, "steepness": 2.0},)
+        # Create scale-specific base name
+        scale_base_name = f"{date_start}_{date_end}_sigma{sigma}"
 
-# MRF regularization parameters
-mrf_regularization = mcmc_config.get("mrf_regularization", True)
-mrf_kwargs = mcmc_config.get("mrf_kwargs", {})
-second_pass = mcmc_config.get("second_pass", "short")
-second_pass_sample_args = mcmc_config.get("second_pass_sample_args", {})
+        # Apply Gaussian smoothing if needed (skipped for sigma=0)
+        df_run = apply_2d_gaussian_filter(df, sigma=sigma)
 
-# Multiscale parameters
-multiscale_config = config.get("multiscale", {})
-sigma_values = multiscale_config.get("sigma_values", [2])
+        # For larger sigma, tighten priors
+        if sigma > 2:
+            mu_params = {"mu": 0, "sigma": 0.5}
+            sigma_params = {"sigma": 0.5}
 
-# Aggregation parameters
-aggregation_config = multiscale_config.get("aggregation", {})
-similarity_threshold = aggregation_config.get("similarity_threshold", 0.7)
-overall_threshold = aggregation_config.get("overall_threshold", 0.8)
+        # Run MCMC clustering with the smoothed data
+        result = run_mcmc_clustering(
+            df_input=df_run,
+            prior_probs=prior_probs_array,
+            sectors=sectors,
+            output_dir=output_dir,
+            base_name=scale_base_name,
+            img=img,
+            variables_names=variables_names,
+            sample_args=sample_args,
+            transform_velocity=velocity_transform,
+            transform_params=transform_params,
+            mu_params=mu_params,
+            sigma_params=sigma_params,
+            random_seed=random_seed,
+            mrf_regularization=mrf_regularization,
+            mrf_kwargs=mrf_kwargs,
+            second_pass=second_pass,
+            second_pass_sample_args=second_pass_sample_args,
+        )
 
-# Loop through smoothing scales
-results = []
-for sigma in sigma_values:
-    logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
+        # Add scale information to result
+        result["sigma"] = sigma
 
-    # Create scale-specific base name
-    scale_base_name = f"{date_start}_{date_end}_sigma{sigma}"
+        # Append to results list
+        results.append(result)
 
-    # Apply Gaussian smoothing if needed (skipped for sigma=0)
-    df_run = apply_2d_gaussian_filter(df, sigma=sigma)
+    # %% == =  AGGREGATE MULTI-SCALE RESULTS  (if multiscale approach)=== #
 
-    # For larger sigma, tighten priors
-    if sigma > 2:
-        mu_params = {"mu": 0, "sigma": 0.5}
-        sigma_params = {"sigma": 0.5}
+    # Multiscale parameters (grouped)
+    multiscale_config = config.get("multiscale", {})
+    aggregation_config = multiscale_config.get("aggregation", {})
+    similarity_threshold = aggregation_config.get("similarity_threshold", 0.7)
+    overall_threshold = aggregation_config.get("overall_threshold", 0.8)
 
-    # Run MCMC clustering with the smoothed data
-    result = run_mcmc_clustering(
-        df_input=df_run,
-        prior_probs=prior_probs_array,
-        sectors=sectors,
-        output_dir=output_dir,
-        base_name=scale_base_name,
-        img=img,
-        variables_names=variables_names,
-        sample_args=sample_args,
-        transform_velocity=velocity_transform,
-        transform_params=transform_params,
-        mu_params=mu_params,
-        sigma_params=sigma_params,
-        random_seed=random_seed,
-        mrf_regularization=mrf_regularization,
-        mrf_kwargs=mrf_kwargs,
-        second_pass=second_pass,
-        second_pass_sample_args=second_pass_sample_args,
+    if len(sigma_values) > 1:
+        aggregated_results = aggregate_multiscale_clustering(
+            results,
+            similarity_threshold=similarity_threshold,
+            overall_threshold=overall_threshold,
+            fig_path=output_dir
+            / f"{reference_start_date}_{reference_end_date}_similarity_heatmap.jpg",
+        )
+
+        # Unpack aggregated results
+        cluster_pred = aggregated_results["combined_cluster_pred"]
+        posterior_probs = aggregated_results["avg_posterior_probs"]
+        entropy = aggregated_results["avg_entropy"]
+        similarity_matrix = aggregated_results["similarity_matrix"]
+        stability_score = aggregated_results["stability_score"]
+        valid_scales = aggregated_results["valid_scales"]
+
+    else:
+        # Otherwise extract the single result
+        cluster_pred = results[0]["cluster_pred"]
+        posterior_probs = results[0]["posterior_probs"]
+        entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
+        similarity_matrix = None
+        stability_score = None
+        valid_scales = None
+
+    # ===  Save final clustering results
+    cluster_aggregation_outs = {
+        "cluster_pred": cluster_pred,
+        "posterior_probs": posterior_probs,
+        "entropy": entropy,
+        "similarity_matrix": similarity_matrix,
+        "stability_score": stability_score,
+        "valid_scales": valid_scales,
+    }
+    joblib.dump(
+        cluster_aggregation_outs,
+        output_dir
+        / f"{reference_start_date}_{reference_end_date}_kinematic_clustering_results.joblib",
     )
 
-    # Add scale information to result
-    result["sigma"] = sigma
+    # %% # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
+    # Retrieve data
+    df_smooth = apply_2d_gaussian_filter(df, sigma=1)
+    x = df_smooth["x"].to_numpy()
+    y = df_smooth["y"].to_numpy()
+    v = df_smooth["V"].to_numpy()
+    kin_cluster = np.asarray(cluster_pred.copy())
 
-    # Append to results list
-    results.append(result)
+    X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=kin_cluster)
 
-
-# %% == =  AGGREGATE MULTI-SCALE RESULTS  (if multiscale approach)=== #
-
-# Multiscale parameters (grouped)
-multiscale_config = config.get("multiscale", {})
-aggregation_config = multiscale_config.get("aggregation", {})
-similarity_threshold = aggregation_config.get("similarity_threshold", 0.7)
-overall_threshold = aggregation_config.get("overall_threshold", 0.8)
-
-if len(sigma_values) > 1:
-    aggregated_results = aggregate_multiscale_clustering(
-        results,
-        similarity_threshold=similarity_threshold,
-        overall_threshold=overall_threshold,
-        fig_path=output_dir
-        / f"{reference_start_date}_{reference_end_date}_similarity_heatmap.jpg",
+    # Filter out small clusters
+    kin_cluster_grid = remove_small_grid_components(
+        kin_cluster_grid, min_size=100, connectivity=8
     )
 
-    # Unpack aggregated results
-    cluster_pred = aggregated_results["combined_cluster_pred"]
-    posterior_probs = aggregated_results["avg_posterior_probs"]
-    entropy = aggregated_results["avg_entropy"]
-    similarity_matrix = aggregated_results["similarity_matrix"]
-    stability_score = aggregated_results["stability_score"]
-    valid_scales = aggregated_results["valid_scales"]
-
-else:
-    # Otherwise extract the single result
-    cluster_pred = results[0]["cluster_pred"]
-    posterior_probs = results[0]["posterior_probs"]
-    entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
-    similarity_matrix = None
-    stability_score = None
-    valid_scales = None
-
-
-# ===  Save final clustering results
-cluster_aggregation_outs = {
-    "cluster_pred": cluster_pred,
-    "posterior_probs": posterior_probs,
-    "entropy": entropy,
-    "similarity_matrix": similarity_matrix,
-    "stability_score": stability_score,
-    "valid_scales": valid_scales,
-}
-joblib.dump(
-    cluster_aggregation_outs,
-    output_dir
-    / f"{reference_start_date}_{reference_end_date}_kinematic_clustering_results.joblib",
-)
-
-# %% # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
-# Retrieve data
-df_smooth = apply_2d_gaussian_filter(df, sigma=1)
-x = df_smooth["x"].to_numpy()
-y = df_smooth["y"].to_numpy()
-v = df_smooth["V"].to_numpy()
-kin_cluster = np.asarray(cluster_pred.copy())
-
-X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=kin_cluster)
-
-# Filter out small clusters
-kin_cluster_grid = remove_small_grid_components(
-    kin_cluster_grid, min_size=100, connectivity=8
-)
-
-# Split clusters along detected discontinuities
-kin_cluster_grid, split_mapping = split_disconnected_components(
-    kin_cluster_grid, connectivity=8, start_label=0
-)
-kin_cluster, x, y = map_grid_to_points(X, Y, kin_cluster_grid, x, y, keep_nan=True)
-
-# Remove non classified points (-1 label)
-valid_mask = kin_cluster >= 0
-x = x[valid_mask]
-y = y[valid_mask]
-v = v[valid_mask]
-kin_cluster = kin_cluster[valid_mask]
-prior_probs_array = prior_probs_array[valid_mask]
-
-# Order clusters by median y descending (bottom = largest y first)
-clusters_ids = np.unique(kin_cluster)
-cluster_median_y = {int(c): float(np.median(y[kin_cluster == c])) for c in clusters_ids}
-ordered_clusters_ids = sorted(
-    clusters_ids, key=lambda c: cluster_median_y[int(c)], reverse=True
-)
-
-# === Compute similarity scores with prior clusters
-# Create a "prior class" assignment based on the sector with highest probability
-sector_names = list(prior_probability.keys())
-sector_assignments = np.zeros_like(kin_cluster)
-for i, point_probs in enumerate(prior_probs_array):
-    sector_assignments[i] = np.argmax(point_probs)
-
-# Compute similarity metrics
-ari = adjusted_rand_score(sector_assignments, kin_cluster)
-ami = adjusted_mutual_info_score(sector_assignments, kin_cluster)
-
-# === Make final clustering plot after cleaning
-fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-ax.imshow(img, alpha=0.5, cmap="gray")
-colormap = plt.get_cmap("tab10")
-for i, label in enumerate(clusters_ids):
-    mask = kin_cluster == label
-    ax.scatter(
-        x[mask],
-        y[mask],
-        color=colormap(i),
-        label=f"Cluster {label}",
-        s=10,
-        alpha=0.7,
+    # Split clusters along detected discontinuities
+    kin_cluster_grid, split_mapping = split_disconnected_components(
+        kin_cluster_grid, connectivity=8, start_label=0
     )
-ax.legend(loc="upper right", framealpha=0.9, fontsize=10)
-ax.set_aspect("equal")
+    kin_cluster, x, y = map_grid_to_points(X, Y, kin_cluster_grid, x, y, keep_nan=True)
 
-if valid_scales is not None and len(valid_scales) > 1:
-    stability_str = f"{stability_score:.2f}" if stability_score is not None else "N/A"
-    title = f"Combined Clustering (scales: {valid_scales}, stability: {stability_str})\nPrior Agreement: AMI={ami:.2f}"
-else:
-    title = f"Clustering (scale: {sigma_values[0]})\nPrior Agreement: AMI={ami if ami is not None else 0.0:.2f}"
+    # Remove non classified points (-1 label)
+    valid_mask = kin_cluster >= 0
+    x = x[valid_mask]
+    y = y[valid_mask]
+    v = v[valid_mask]
+    kin_cluster = kin_cluster[valid_mask]
+    prior_probs_array = prior_probs_array[valid_mask]
 
-ax.set_title(title)
-plt.savefig(
-    output_dir
-    / f"{reference_start_date}_{reference_end_date}_kinematic_clustering.png",
-    dpi=300,
-    bbox_inches="tight",
-)
+    # Order clusters by median y descending (bottom = largest y first)
+    clusters_ids = np.unique(kin_cluster)
+    cluster_median_y = {
+        int(c): float(np.median(y[kin_cluster == c])) for c in clusters_ids
+    }
+    ordered_clusters_ids = sorted(
+        clusters_ids, key=lambda c: cluster_median_y[int(c)], reverse=True
+    )
 
-# %% # ===  AUTOMATIC MORPHO-KINEMATIC SECTOR ASSIGNMENT  === #
+    # === Compute similarity scores with prior clusters
+    # Create a "prior class" assignment based on the sector with highest probability
+    sector_names = list(prior_probability.keys())
+    sector_assignments = np.zeros_like(kin_cluster)
+    for i, point_probs in enumerate(prior_probs_array):
+        sector_assignments[i] = np.argmax(point_probs)
 
-# Morphokinematic parameters
-morphokinematic_config = config.get("morphokinematic", {})
-minor_overlap_threshold = morphokinematic_config.get("minor_overlap_threshold", 0.9)
-base_colors = morphokinematic_config.get(
-    "base_colors",
-    {
-        "A": "#b3140b",
-        "B": "#ee9c21",
-        "C": "#f1ee30",
-        "D": "#5fb61c",
-    },
-)
+    # Compute similarity metrics
+    ari = adjusted_rand_score(sector_assignments, kin_cluster)
+    ami = adjusted_mutual_info_score(sector_assignments, kin_cluster)
 
-cmap = plt.get_cmap("tab20")
-assignment = auto_assign_mk_sectors(
-    x=x,
-    y=y,
-    kin_cluster=kin_cluster,
-    ordered_clusters_ids=ordered_clusters_ids,
-    overlap_threshold=minor_overlap_threshold,
-)
+    # === Make final clustering plot after cleaning
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.imshow(img, alpha=0.5, cmap="gray")
+    colormap = plt.get_cmap("tab10")
+    for i, label in enumerate(clusters_ids):
+        mask = kin_cluster == label
+        ax.scatter(
+            x[mask],
+            y[mask],
+            color=colormap(i),
+            label=f"Cluster {label}",
+            s=10,
+            alpha=0.7,
+        )
+    ax.legend(loc="upper right", framealpha=0.9, fontsize=10)
+    ax.set_aspect("equal")
 
-mk_label_str = assignment["mk_label_str"]
-mk_label_id = assignment["mk_label_id"]
-major_clusters = assignment["major_clusters"]
-major_label_map = assignment["major_label_map"]
-minor_parent = assignment["minor_parent"]
-cluster_to_label = assignment["cluster_to_label"]
-polygons_major = assignment["polygons_major"]
-polygons_minor = assignment["polygons_minor"]
+    if valid_scales is not None and len(valid_scales) > 1:
+        stability_str = (
+            f"{stability_score:.2f}" if stability_score is not None else "N/A"
+        )
+        title = f"Combined Clustering (scales: {valid_scales}, stability: {stability_str})\nPrior Agreement: AMI={ami:.2f}"
+    else:
+        title = f"Clustering (scale: {sigma_values[0]})\nPrior Agreement: AMI={ami if ami is not None else 0.0:.2f}"
 
-label_order = sorted(assignment["label_to_index"].items(), key=lambda kv: kv[1])
-unique_mk = np.array([lab for lab, _ in label_order], dtype=object)
-counts = np.array([np.sum(mk_label_str == lab) for lab in unique_mk], dtype=int)
+    ax.set_title(title)
+    plt.savefig(
+        output_dir
+        / f"{reference_start_date}_{reference_end_date}_kinematic_clustering.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
 
-logger.info("Major sectors: %s", major_label_map)
-if minor_parent:
-    logger.info(
-        "Minor cluster mapping: %s",
+    # %% # ===  AUTOMATIC MORPHO-KINEMATIC SECTOR ASSIGNMENT  === #
+
+    # Morphokinematic parameters
+    morphokinematic_config = config.get("morphokinematic", {})
+    minor_overlap_threshold = morphokinematic_config.get("minor_overlap_threshold", 0.9)
+    base_colors = morphokinematic_config.get(
+        "base_colors",
         {
-            cluster_id: {
-                "label": cluster_to_label[cluster_id],
-                "parent": cluster_to_label[parent_id],
-                "overlap": f"{overlap_ratio:.2f}",
-            }
-            for cluster_id, (parent_id, overlap_ratio) in minor_parent.items()
+            "A": "#b3140b",
+            "B": "#ee9c21",
+            "C": "#f1ee30",
+            "D": "#5fb61c",
         },
     )
-else:
-    logger.info("No minor clusters detected.")
 
-
-print("Morpho-kinematic assignment summary:")
-for label, count in zip(unique_mk, counts, strict=False):
-    print(f"  {label}: {count} points")
-
-
-colors = {}
-for idx, label in enumerate(unique_mk):
-    major_key = "".join(filter(str.isalpha, label)) or label
-    color = base_colors.get(label) or base_colors.get(major_key)
-    if color is None:
-        color = mcolors.to_hex(cmap(idx % cmap.N))
-    colors[label] = color
-
-fig, ax = plt.subplots(figsize=(8, 8))
-ax.imshow(img, alpha=0.5, cmap="gray")
-
-major_labels = [
-    cluster_to_label[cid] for cid in major_clusters if cid in cluster_to_label
-]
-for label in major_labels:
-    poly = polygons_major.get(label)
-    if poly is not None:
-        draw_polygon(
-            ax, poly, label, colors.get(label, "#444444"), fill_alpha=0.12, zorder=1
-        )
-
-minor_labels = [label for label in unique_mk if label not in major_labels]
-for label in minor_labels:
-    poly = polygons_minor.get(label)
-    if poly is not None:
-        draw_polygon(
-            ax, poly, label, colors.get(label, "#888888"), fill_alpha=0.08, zorder=2
-        )
-
-handles, labels = ax.get_legend_handles_labels()
-unique_handles = []
-unique_labels = []
-seen = set()
-for handle, name in zip(handles, labels, strict=False):
-    if name in seen:
-        continue
-    seen.add(name)
-    unique_handles.append(handle)
-    unique_labels.append(name)
-if unique_handles:
-    ax.legend(
-        unique_handles,
-        unique_labels,
-        loc="upper right",
-        fontsize=9,
-        framealpha=0.9,
+    cmap = plt.get_cmap("tab20")
+    assignment = auto_assign_mk_sectors(
+        x=x,
+        y=y,
+        kin_cluster=kin_cluster,
+        ordered_clusters_ids=ordered_clusters_ids,
+        overlap_threshold=minor_overlap_threshold,
     )
 
-ax.set_title("Morpho-Kinematic Sectors")
-ax.set_aspect("equal")
-fig.savefig(
-    output_dir
-    / f"{reference_start_date}_{reference_end_date}_mk_sectors_perimeters.png",
-    dpi=300,
-    bbox_inches="tight",
-)
+    mk_label_str = assignment["mk_label_str"]
+    mk_label_id = assignment["mk_label_id"]
+    major_clusters = assignment["major_clusters"]
+    major_label_map = assignment["major_label_map"]
+    minor_parent = assignment["minor_parent"]
+    cluster_to_label = assignment["cluster_to_label"]
+    polygons_major = assignment["polygons_major"]
+    polygons_minor = assignment["polygons_minor"]
 
-# %% # ===  COMPUTE AND SAVE MORPHO-KINEMATIC SECTOR STATISTICS  === #
-mk_stats = compute_mk_sector_stats(
-    polygons_major,
-    mk_label_str,
-    x=x,
-    y=y,
-    v=v,
-    img_shape=np.asarray(img).shape if img is not None else None,
-    rasterize=True,
-)
-mk_stats.to_csv(
-    output_dir / f"{reference_start_date}_{reference_end_date}_mk_sector_stats.csv",
-    index=False,
-)
+    label_order = sorted(assignment["label_to_index"].items(), key=lambda kv: kv[1])
+    unique_mk = np.array([lab for lab, _ in label_order], dtype=object)
+    counts = np.array([np.sum(mk_label_str == lab) for lab in unique_mk], dtype=int)
+
+    logger.info("Major sectors: %s", major_label_map)
+    if minor_parent:
+        logger.info(
+            "Minor cluster mapping: %s",
+            {
+                cluster_id: {
+                    "label": cluster_to_label[cluster_id],
+                    "parent": cluster_to_label[parent_id],
+                    "overlap": f"{overlap_ratio:.2f}",
+                }
+                for cluster_id, (parent_id, overlap_ratio) in minor_parent.items()
+            },
+        )
+    else:
+        logger.info("No minor clusters detected.")
+
+    print("Morpho-kinematic assignment summary:")
+    for label, count in zip(unique_mk, counts, strict=False):
+        print(f"  {label}: {count} points")
+
+    colors = {}
+    for idx, label in enumerate(unique_mk):
+        major_key = "".join(filter(str.isalpha, label)) or label
+        color = base_colors.get(label) or base_colors.get(major_key)
+        if color is None:
+            color = mcolors.to_hex(cmap(idx % cmap.N))
+        colors[label] = color
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(img, alpha=0.5, cmap="gray")
+
+    major_labels = [
+        cluster_to_label[cid] for cid in major_clusters if cid in cluster_to_label
+    ]
+    for label in major_labels:
+        poly = polygons_major.get(label)
+        if poly is not None:
+            draw_polygon(
+                ax, poly, label, colors.get(label, "#444444"), fill_alpha=0.12, zorder=1
+            )
+
+    minor_labels = [label for label in unique_mk if label not in major_labels]
+    for label in minor_labels:
+        poly = polygons_minor.get(label)
+        if poly is not None:
+            draw_polygon(
+                ax, poly, label, colors.get(label, "#888888"), fill_alpha=0.08, zorder=2
+            )
+
+    handles, labels = ax.get_legend_handles_labels()
+    unique_handles = []
+    unique_labels = []
+    seen = set()
+    for handle, name in zip(handles, labels, strict=False):
+        if name in seen:
+            continue
+        seen.add(name)
+        unique_handles.append(handle)
+        unique_labels.append(name)
+    if unique_handles:
+        ax.legend(
+            unique_handles,
+            unique_labels,
+            loc="upper right",
+            fontsize=9,
+            framealpha=0.9,
+        )
+
+    ax.set_title("Morpho-Kinematic Sectors")
+    ax.set_aspect("equal")
+    fig.savefig(
+        output_dir
+        / f"{reference_start_date}_{reference_end_date}_mk_sectors_perimeters.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    # %% # ===  COMPUTE AND SAVE MORPHO-KINEMATIC SECTOR STATISTICS  === #
+    mk_stats = compute_mk_sector_stats(
+        polygons_major,
+        mk_label_str,
+        x=x,
+        y=y,
+        v=v,
+        img_shape=np.asarray(img).shape if img is not None else None,
+        rasterize=True,
+    )
+    mk_stats.to_csv(
+        output_dir / f"{reference_start_date}_{reference_end_date}_mk_sector_stats.csv",
+        index=False,
+    )
+
+
+# %% # === ENTRY POINT  === #
+if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Run MCMC clustering with optional overrides."
+    )
+    p.add_argument(
+        "--reference-date", "-d", help="Override data.reference_date (YYYY-MM-DD)."
+    )
+    args = p.parse_args()
+
+    main(reference_date=args.reference_date)
