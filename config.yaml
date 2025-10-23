@@ -11,13 +11,10 @@ api:
   port: 8080
   image_view: "images"
 
-# Random seed for reproducibility
-random_seed: 8927
-
 # Data selection parameters
 data:
-  camera_name: "PPCX_Tele"
   reference_date: "2017-07-09"
+  camera_name: "PPCX_Tele"
   days_before_to_include: 0
   days_after_to_include: 0
   dt_min: 72  # Minimum time difference between images in hours
@@ -25,11 +22,11 @@ data:
   roi_path: "data/roi.xml"
   sector_prior_file: "data/priors_4_sectors.xml"
   variables_names: ["V"] # List of variable names to process
-  output_dir: "output"
+  output_dir: "output_batch"
 
 # Data preprocessing parameters
 preprocessing:
-  subsample_factor: 1
+  subsample_factor: 1 # 2 means keep every 2nd point, 1 means no subsampling
   subsample_method: "regular"  # or 'random'
   filter_kwargs:
     filter_outliers: false
@@ -100,8 +97,11 @@ multiscale:
 # Morpho-kinematic analysis parameters
 morphokinematic:
   minor_overlap_threshold: 0.9
-  base_colors:
+  sector_colors:
     A: "#b3140b"
     B: "#ee9c21"
     C: "#f1ee30"
     D: "#5fb61c"
+
+# Random seed for reproducibility
+random_seed: 8927

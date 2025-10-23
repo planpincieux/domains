@@ -1,10 +1,12 @@
 # %% # ===  IMPORTS  === #
 import argparse
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 import arviz as az
 import joblib
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import pymc as pm
@@ -697,17 +699,9 @@ def main(reference_date: str | None = None):
     # Morphokinematic parameters
     morphokinematic_config = config.get("morphokinematic", {})
     minor_overlap_threshold = morphokinematic_config.get("minor_overlap_threshold", 0.9)
-    base_colors = morphokinematic_config.get(
-        "base_colors",
-        {
-            "A": "#b3140b",
-            "B": "#ee9c21",
-            "C": "#f1ee30",
-            "D": "#5fb61c",
-        },
-    )
+    sector_colors = morphokinematic_config.get("sector_colors", None)
+    default_cmap = plt.get_cmap("tab20")
 
-    cmap = plt.get_cmap("tab20")
     assignment = auto_assign_mk_sectors(
         x=x,
         y=y,
@@ -751,10 +745,11 @@ def main(reference_date: str | None = None):
 
     colors = {}
     for idx, label in enumerate(unique_mk):
-        major_key = "".join(filter(str.isalpha, label)) or label
-        color = base_colors.get(label) or base_colors.get(major_key)
-        if color is None:
-            color = mcolors.to_hex(cmap(idx % cmap.N))
+        if sector_colors is not None:
+            major_key = "".join(filter(str.isalpha, label)) or label
+            color = sector_colors.get(label) or sector_colors.get(major_key)
+        else:
+            color = mcolors.to_hex(default_cmap(idx % default_cmap.N))
         colors[label] = color
 
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -763,11 +758,16 @@ def main(reference_date: str | None = None):
     major_labels = [
         cluster_to_label[cid] for cid in major_clusters if cid in cluster_to_label
     ]
+    legend_patches = {}
     for label in major_labels:
         poly = polygons_major.get(label)
         if poly is not None:
             draw_polygon(
                 ax, poly, label, colors.get(label, "#444444"), fill_alpha=0.12, zorder=1
+            )
+            # ensure we have a legend patch for this label
+            legend_patches[label] = mpatches.Patch(
+                color=colors.get(label, "#444444"), label=label, alpha=0.4
             )
 
     minor_labels = [label for label in unique_mk if label not in major_labels]
@@ -777,26 +777,19 @@ def main(reference_date: str | None = None):
             draw_polygon(
                 ax, poly, label, colors.get(label, "#888888"), fill_alpha=0.08, zorder=2
             )
+            if label not in legend_patches:
+                legend_patches[label] = mpatches.Patch(
+                    color=colors.get(label, "#888888"), label=label, alpha=0.25
+                )
 
-    handles, labels = ax.get_legend_handles_labels()
-    unique_handles = []
-    unique_labels = []
-    seen = set()
-    for handle, name in zip(handles, labels, strict=False):
-        if name in seen:
-            continue
-        seen.add(name)
-        unique_handles.append(handle)
-        unique_labels.append(name)
-    if unique_handles:
+    if legend_patches:
         ax.legend(
-            unique_handles,
-            unique_labels,
+            handles=list(legend_patches.values()),
+            labels=list(legend_patches.keys()),
             loc="upper right",
             fontsize=9,
             framealpha=0.9,
         )
-
     ax.set_title("Morpho-Kinematic Sectors")
     ax.set_aspect("equal")
     fig.savefig(
@@ -816,6 +809,153 @@ def main(reference_date: str | None = None):
         rasterize=True,
     )
     mk_stats.to_csv(output_dir / f"{base_name}_mk_sector_stats.csv", index=False)
+
+    # ------------------------------
+    # FINAL SUMMARY FIGURE FOR QUICK INSPECTION
+    # create a single figure that contains:
+    #  - velocity field
+    #  - morpho-kinematic perimeters
+    #  - a compact table with mk_stats (top rows)
+    # save it into the detailed output_dir and also copy to a simple quick_inspect folder
+    # TODO: DO NOT REPEAT CODE, MAKE A FUNCTION OUT OF THIS
+    # ------------------------------
+    try:
+        quick_fig, axs = plt.subplots(
+            1,
+            3,
+            figsize=(16, 8),
+            gridspec_kw={"width_ratios": [1.0, 1.0, 0.9]},
+        )
+        ax_vf, ax_mk, ax_table = axs
+        # reduce whitespace around subplots
+        quick_fig.subplots_adjust(
+            left=0.02, right=0.98, top=0.98, bottom=0.02, wspace=0.01, hspace=0.01
+        )
+
+        # 1) Velocity field
+        ax_vf.imshow(img, alpha=0.5, cmap="gray")
+        u_quiv = df["u"].to_numpy()
+        v_quiv = df["v"].to_numpy()
+        mags = np.sqrt(u_quiv**2 + v_quiv**2)
+        ax_vf.quiver(
+            df["x"].to_numpy(),
+            df["y"].to_numpy(),
+            u_quiv,
+            v_quiv,
+            mags,
+            scale=None,
+            scale_units="xy",
+            angles="xy",
+            cmap="viridis",
+            width=0.006,
+            headwidth=2.0,
+        )
+        ax_vf.set_title("Velocity field")
+        ax_vf.set_aspect("equal")
+        ax_vf.set_xticks([])
+        ax_vf.set_yticks([])
+
+        # 2) Morpho-kinematic perimeters
+        ax_mk.imshow(img, alpha=0.5, cmap="gray")
+        legend_patches_quick = {}
+        for label in major_labels:
+            poly = polygons_major.get(label)
+            if poly is not None:
+                draw_polygon(
+                    ax_mk,
+                    poly,
+                    label,
+                    colors.get(label, "#444444"),
+                    fill_alpha=0.10,
+                    zorder=1,
+                )
+                legend_patches_quick[label] = mpatches.Patch(
+                    color=colors.get(label, "#444444"), label=label, alpha=0.4
+                )
+        for label in minor_labels:
+            poly = polygons_minor.get(label)
+            if poly is not None:
+                draw_polygon(
+                    ax_mk,
+                    poly,
+                    label,
+                    colors.get(label, "#888888"),
+                    fill_alpha=0.06,
+                    zorder=2,
+                )
+                if label not in legend_patches_quick:
+                    legend_patches_quick[label] = mpatches.Patch(
+                        color=colors.get(label, "#888888"), label=label, alpha=0.25
+                    )
+        if legend_patches_quick:
+            ax_mk.legend(
+                handles=list(legend_patches_quick.values()),
+                labels=list(legend_patches_quick.keys()),
+                loc="upper right",
+                fontsize=8,
+                framealpha=0.9,
+            )
+        ax_mk.set_title("Morpho-kinematic perimeters")
+        ax_mk.set_aspect("equal")
+        ax_mk.set_xticks([])
+        ax_mk.set_yticks([])
+
+        # 3) Compact statistics table from mk_stats
+        ax_table.axis("off")
+        cols = [
+            "label",
+            "area_px2",
+            "centroid_x",
+            "centroid_y",
+            "compactness",
+            "v_mean",
+            "v_std",
+            "v_min",
+            "v_max",
+        ]
+        display_df = mk_stats[cols].copy()
+        # set label as columns and transpose so rows = variables, cols = sector labels
+        display_df = display_df.set_index("label").T.round(2)
+
+        # limit number of sector columns for readability (keep first N if many)
+        max_labels = 8
+        if display_df.shape[1] > max_labels:
+            display_df = display_df.iloc[:, :max_labels]
+
+        col_labels = list(display_df.columns)
+        row_labels = list(display_df.index)
+
+        table = ax_table.table(
+            cellText=display_df.values,
+            colLabels=col_labels,
+            rowLabels=row_labels,
+            loc="center",
+            cellLoc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.2)
+        ax_table.set_title("Morpho-kinematic stats per sector")
+
+        quick_fig.tight_layout()
+
+        # Save inside detailed output folder
+        summary_path = output_dir / f"{base_name}_sectors_summary.png"
+        quick_fig.savefig(summary_path, dpi=200, bbox_inches="tight")
+        plt.close(quick_fig)
+
+    except Exception as exc:
+        logger.warning("Failed to create quick summary figure: %s", exc)
+        summary_path = None
+
+    if summary_path is not None:
+        # Also copy to a simple "summary" folder (no subfolders)
+        quick_dir = output_base_dir / "summary"
+        quick_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(summary_path, quick_dir / f"{base_name}_sectors_summary.png")
+        logger.info(
+            "Saved quick summary to %s and copied to %s", summary_path, quick_dir
+        )
 
 
 # %% # === ENTRY POINT  === #
