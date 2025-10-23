@@ -608,8 +608,7 @@ def main(reference_date: str | None = None):
     }
     joblib.dump(
         cluster_aggregation_outs,
-        output_dir
-        / f"{reference_start_date}_{reference_end_date}_kinematic_clustering_results.joblib",
+        output_dir / f"{base_name}_kinematic_clustering_results.joblib",
     )
 
     # %% # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
@@ -688,8 +687,7 @@ def main(reference_date: str | None = None):
 
     ax.set_title(title)
     plt.savefig(
-        output_dir
-        / f"{reference_start_date}_{reference_end_date}_kinematic_clustering.png",
+        output_dir / f"{base_name}_kinematic_clustering.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -802,8 +800,7 @@ def main(reference_date: str | None = None):
     ax.set_title("Morpho-Kinematic Sectors")
     ax.set_aspect("equal")
     fig.savefig(
-        output_dir
-        / f"{reference_start_date}_{reference_end_date}_mk_sectors_perimeters.png",
+        output_dir / f"{base_name}_mk_sectors_perimeters.png",
         dpi=300,
         bbox_inches="tight",
     )
@@ -818,10 +815,7 @@ def main(reference_date: str | None = None):
         img_shape=np.asarray(img).shape if img is not None else None,
         rasterize=True,
     )
-    mk_stats.to_csv(
-        output_dir / f"{reference_start_date}_{reference_end_date}_mk_sector_stats.csv",
-        index=False,
-    )
+    mk_stats.to_csv(output_dir / f"{base_name}_mk_sector_stats.csv", index=False)
 
 
 # %% # === ENTRY POINT  === #
