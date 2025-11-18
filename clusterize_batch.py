@@ -1,8 +1,6 @@
 import argparse
 import concurrent.futures
-import glob
 import random
-import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -55,11 +53,6 @@ def parse_args():
         help="Number of parallel processes to run simultaneously (default 1).",
     )
     p.add_argument(
-        "--central-summary",
-        default="summary_batch",
-        help="Folder where summary pngs will be collected (no subfolders).",
-    )
-    p.add_argument(
         "--timeout",
         type=int,
         default=None,
@@ -77,6 +70,33 @@ def load_dates_from_file(path: Path):
                 continue
             dates.append(s)
     return dates
+
+
+def _parse_months_spec(spec: str):
+    """
+    Parse a months spec like '1-5,11-12,7' into a set of ints {1,2,3,4,5,11,12,7}
+    """
+    out = set()
+    if not spec:
+        return out
+    parts = spec.split(",")
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if "-" in p:
+            a, b = p.split("-", 1)
+            a_i = int(a)
+            b_i = int(b)
+            if a_i <= b_i:
+                out.update(range(a_i, b_i + 1))
+            else:
+                # wrap-around e.g. 11-2 -> 11,12,1,2
+                out.update(list(range(a_i, 13)) + list(range(1, b_i + 1)))
+        else:
+            out.add(int(p))
+    # keep only valid months
+    return {m for m in out if 1 <= m <= 12}
 
 
 def random_dates_between(
@@ -116,54 +136,6 @@ def random_dates_between(
     return [d.strftime("%Y-%m-%d") for d in picked]
 
 
-def _parse_months_spec(spec: str):
-    """
-    Parse a months spec like '1-5,11-12,7' into a set of ints {1,2,3,4,5,11,12,7}
-    """
-    out = set()
-    if not spec:
-        return out
-    parts = spec.split(",")
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        if "-" in p:
-            a, b = p.split("-", 1)
-            a_i = int(a)
-            b_i = int(b)
-            if a_i <= b_i:
-                out.update(range(a_i, b_i + 1))
-            else:
-                # wrap-around e.g. 11-2 -> 11,12,1,2
-                out.update(list(range(a_i, 13)) + list(range(1, b_i + 1)))
-        else:
-            out.add(int(p))
-    # keep only valid months
-    return {m for m in out if 1 <= m <= 12}
-
-
-def find_and_copy_summary(date_str: str, central_dir: Path):
-    # Search recursively for summary files that contain the date string and end with _summary.png
-    pattern = f"**/*{date_str}*_summary.png"
-    hits = glob.glob(pattern, recursive=True)
-    if not hits:
-        # also try more generic search (contain date anywhere and summary)
-        hits = [
-            p for p in glob.glob("**/*summary.png", recursive=True) if date_str in p
-        ]
-    copied = []
-    for p in hits:
-        src = Path(p)
-        dst = central_dir / src.name
-        try:
-            shutil.copy(src, dst)
-            copied.append(dst)
-        except Exception as exc:
-            print(f"[WARN] Failed to copy {src} -> {dst}: {exc}")
-    return copied
-
-
 def run_one_date(python: str, script: str, date: str, timeout=None):
     cmd = [python, script, "--reference-date", date]
     print(f"[RUN] {' '.join(cmd)}")
@@ -200,7 +172,9 @@ def main():
             try:
                 include_months = _parse_months_spec(args.season)
             except Exception:
-                raise SystemExit("Invalid --season format. Use M-M (e.g. 6-10).")
+                raise SystemExit(
+                    "Invalid --season format. Use M-M (e.g. 6-10)."
+                ) from None
         elif args.exclude_months:
             exclude_months = _parse_months_spec(args.exclude_months)
         try:
@@ -212,10 +186,7 @@ def main():
                 exclude_months=exclude_months,
             )
         except Exception as exc:
-            raise SystemExit(f"Could not sample dates: {exc}")
-
-    central_dir = Path(args.central_summary)
-    central_dir.mkdir(parents=True, exist_ok=True)
+            raise SystemExit(f"Could not sample dates: {exc}") from None
 
     # run jobs (parallel or sequential)
     results = {}
@@ -225,12 +196,6 @@ def main():
                 args.python, args.script_path, d, timeout=args.timeout
             )
             results[d] = ok
-            # try to collect summary images for this run
-            copied = find_and_copy_summary(d, central_dir)
-            if copied:
-                print(f"[COPY] Collected {len(copied)} summary files for {d}")
-            else:
-                print(f"[WARN] No summary files found for {d}")
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
             futs = {
@@ -247,11 +212,6 @@ def main():
                     ok = False
                     print(f"[ERR] Exception running {d}: {exc}")
                 results[d] = ok
-                copied = find_and_copy_summary(d, central_dir)
-                if copied:
-                    print(f"[COPY] Collected {len(copied)} summary files for {d}")
-                else:
-                    print(f"[WARN] No summary files found for {d}")
 
     # summary
     succ = [d for d, ok in results.items() if ok]

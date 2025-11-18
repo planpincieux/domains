@@ -28,7 +28,7 @@ from ppcluster.mcmc.postproc import (
 from ppcluster.preprocessing import (
     apply_dic_filters,
 )
-from ppcluster.utils.config import ConfigManager
+from ppcluster.config import ConfigManager
 from ppcluster.utils.database import (
     fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,

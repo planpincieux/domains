@@ -40,7 +40,7 @@ from ppcluster.preprocessing import (
     preprocess_velocity_features,
     spatial_subsample,
 )
-from ppcluster.utils.config import ConfigManager
+from ppcluster.config import ConfigManager
 from ppcluster.utils.database import (
     fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,

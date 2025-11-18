@@ -21,6 +21,7 @@ from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
 from ppcluster import logger, mcmc
+from ppcluster.config import ConfigManager
 from ppcluster.cvat import (
     filter_dataframe_by_polygons,
     read_polygons_from_cvat,
@@ -42,7 +43,6 @@ from ppcluster.preprocessing import (
     preprocess_velocity_features,
     spatial_subsample,
 )
-from ppcluster.utils.config import ConfigManager
 from ppcluster.utils.database import (
     fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,

@@ -7,7 +7,7 @@ import requests
 from PIL import Image
 from sqlalchemy import create_engine, text
 
-from .config import ConfigManager
+from ppcluster.config import ConfigManager
 
 logger = logging.getLogger("ppcx")
 

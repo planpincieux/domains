@@ -4,10 +4,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 
 CONFIG_PATH = Path.cwd() / "config.yaml"
 logger = logging.getLogger("ppcx")
+
+# Read .env file if exists for sensitive environment variables
+load_dotenv()
 
 
 @dataclass
