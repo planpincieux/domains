@@ -4,14 +4,45 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from omegaconf import DictConfig, OmegaConf
 
-CONFIG_PATH = Path.cwd() / "config.yaml"
 logger = logging.getLogger("ppcx")
 
-# Read .env file if exists for sensitive environment variables
-load_dotenv()
+
+def _init_env() -> None:
+    """Load environment variables from the nearest .env (like VS Code does)."""
+    # Search upward from current working dir
+    load_dotenv(find_dotenv(usecwd=True), override=False)
+
+
+def _find_config_path() -> Path:
+    """Find config.yaml via env var or by searching common locations."""
+    # 1) Explicit override
+    env_path = os.getenv("PPCX_CONFIG")
+    if env_path:
+        return Path(env_path).expanduser().resolve()
+    # 2) CWD (works for `python make_collapses_plots.py` from repo folder)
+    for name in ("config.yaml", "config.yml"):
+        p = Path.cwd() / name
+        if p.exists():
+            return p.resolve()
+    # 3) Near this file (works if run from other dirs)
+    here = Path(__file__).resolve()
+    for base in [here.parent, *here.parents]:
+        for name in ("config.yaml", "config.yml"):
+            p = base / name
+            if p.exists():
+                return p.resolve()
+    # Fallback (may raise later if missing)
+    return (Path.cwd() / "config.yaml").resolve()
+
+
+# Load env early
+_init_env()
+
+# Determine config path
+CONFIG_PATH = _find_config_path()
 
 
 @dataclass
